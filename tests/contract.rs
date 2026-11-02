@@ -20,11 +20,12 @@ const COMMANDS: &[&str] = &[
     "ij", "iej", "iSj", "iSSj", "irj", "iij", "iEj", "isj", "ilj", "icj", "izj", "izzj", "iHj",
     "ihj", "iCj", "iVj", "iRj", // flags
     "flj", "fslj", "fss+", "fss-", "f+", "f-", "fd", // functions and references
-    "aflj", "afij", "afvlj", "af", "afn", "afvn", "afs", "afsj", "afsbj", "axtj", "axfj", "agf",
+    "afl", "aflc", "aflj", "afij", "afvlj", "af", "afn", "afvn", "afs", "afsj", "afsbj", "axtj",
+    "axfj", "agf",
     // printing
     "pdj", "pdfj", "pdr", "pxj", "p8", "pa", "aoj", "ph", "phlj", "plf", "Lcj", "aij",
     // comments, projects, writing
-    "CC", "CC-", "CC.", "Ps", "wx", // searching and diffing
+    "CC", "CC-", "CC.", "Ps", "Po", "wx", // searching and diffing
     "/xj", "/v1j", "/v2j", "/v4j", "/v8j", "/Rj", "/mj", "/cmj", "cxj", "cfj",
     // FLIRT and RzIL
     "Fl", "Fa", "Fs", "Fd", "Fc", "aezi", "aezsej", // debugger
@@ -136,7 +137,14 @@ fn commands_in_server_source() -> Vec<String> {
     let src = include_str!("../src/server.rs");
     let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
     let mut found = Vec::new();
-    for call in [".cmd(", ".cmdj(", ".exec(", "cmd_strict(", "cmdj_optional("] {
+    for call in [
+        ".cmd(",
+        ".cmdj(",
+        ".exec(",
+        "cmd_strict(",
+        "cmdj_optional(",
+        "listing_cmd(",
+    ] {
         for (pos, _) in src.match_indices(call) {
             let rest = src[pos + call.len()..].trim_start();
             let rest = rest.strip_prefix("&format!(").unwrap_or(rest).trim_start();

@@ -4,6 +4,7 @@
 //! serialising command access through it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,12 +49,21 @@ impl AnalysisLevel {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct StringEntry {
+    pub vaddr: u64,
+    pub size: u64,
+    pub string: String,
+    pub ascii: bool,
+}
+
 /// A single open Rizin session.
 struct Session {
     backend: Backend,
     file: String,
     write: bool,
     analysis: AnalysisLevel,
+    strings: Option<Arc<Vec<StringEntry>>>,
     /// The file holding bytes opened with [`SessionManager::open_bytes`];
     /// declared after `backend` so Rizin closes it before it is deleted.
     _data: Option<TempFile>,
@@ -147,6 +157,7 @@ pub struct OpenInfo {
     pub write: bool,
     /// The analysis level that was applied.
     pub analysis: AnalysisLevel,
+    pub functions: usize,
     /// The parsed output of `ij` (binary info), or `null` if unavailable.
     pub info: Value,
     /// Why the requested analysis failed, if Rizin reported a failure. The
@@ -200,6 +211,124 @@ impl SessionManager {
         write: bool,
     ) -> Result<OpenInfo, RizinError> {
         self.open_with(path, analysis, write, None).await
+    }
+
+    pub async fn open_project(&self, path: &str, write: bool) -> Result<OpenInfo, RizinError> {
+        if write && !self.config.allow_write {
+            return Err(RizinError::NotPermitted(
+                "write mode is disabled; start the server with --allow-write".into(),
+            ));
+        }
+
+        let quoted_project = crate::util::quote_arg(path)?;
+        if !Path::new(path).exists() {
+            return Err(RizinError::FileNotFound(path.to_string()));
+        }
+        if Path::new(path).is_dir() {
+            return Err(RizinError::InvalidArgument {
+                arg: path.to_string(),
+                reason: "is a directory, not a project file".into(),
+            });
+        }
+
+        self.close().await;
+
+        let backend = match self.config.transport {
+            Transport::Pipe => {
+                let mut extra = vec!["-p".to_string(), path.to_string()];
+                if write {
+                    extra.push("-w".to_string());
+                }
+                Backend::Pipe(
+                    RizinPipe::spawn(
+                        &self.config.rizin_binary,
+                        None,
+                        &extra,
+                        self.config.startup_timeout,
+                        self.config.command_timeout,
+                    )
+                    .await?,
+                )
+            }
+            _ => {
+                let b = self.spawn_backend(EMPTY_SESSION, write).await?;
+                let po_cmd = format!("Po {quoted_project}");
+                let out = b.exec(&po_cmd).await?;
+                let out = check(&po_cmd, out)?;
+                let errors: Vec<&str> = out
+                    .messages
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|m| m.starts_with("ERROR"))
+                    .collect();
+                if !errors.is_empty() {
+                    return Err(RizinError::CommandFailed {
+                        cmd: po_cmd,
+                        status: crate::status::CmdStatus::Error,
+                        detail: errors.join("\n"),
+                    });
+                }
+                if write {
+                    let out = b.exec("oo+").await?;
+                    let out = check("oo+", out)?;
+                    let errors: Vec<&str> = out
+                        .messages
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|m| m.starts_with("ERROR"))
+                        .collect();
+                    if !errors.is_empty() {
+                        return Err(RizinError::CommandFailed {
+                            cmd: "oo+".to_string(),
+                            status: crate::status::CmdStatus::Error,
+                            detail: errors.join("\n"),
+                        });
+                    }
+                }
+                b
+            }
+        };
+
+        let _ = backend
+            .exec("e scr.color=0;e scr.interactive=false;e scr.html=false")
+            .await;
+        if let Some(dir) = &self.config.sigdb_path {
+            let cmd = format!("e flirt.sigdb.path={}", crate::util::quote_arg(dir)?);
+            check(&cmd, backend.exec(&cmd).await?)?;
+        }
+
+        let info = backend.cmdj("ij").await.unwrap_or(Value::Null);
+        let functions = backend
+            .cmd("aflc")
+            .await
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let session = Session {
+            backend,
+            file: path.to_string(),
+            write,
+            analysis: AnalysisLevel::None,
+            strings: None,
+            _data: None,
+        };
+
+        *self.inner.lock().await = Slot {
+            session: Some(session),
+            ended: None,
+            journal_file: Some(path.to_string()),
+            journal: Vec::new(),
+        };
+
+        Ok(OpenInfo {
+            file: path.to_string(),
+            write,
+            analysis: AnalysisLevel::None,
+            functions,
+            info,
+            analysis_error: None,
+        })
     }
 
     /// Open `bytes` (e.g. a sample sent by the client) as a file named after
@@ -281,12 +410,19 @@ impl SessionManager {
             }
         }
         let info = backend.cmdj("ij").await.unwrap_or(Value::Null);
+        let functions = backend
+            .cmd("aflc")
+            .await
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
 
         let session = Session {
             backend,
             file: path.to_string(),
             write,
             analysis,
+            strings: None,
             _data: data,
         };
 
@@ -301,6 +437,7 @@ impl SessionManager {
             file: path.to_string(),
             write,
             analysis,
+            functions,
             info,
             analysis_error,
         })
@@ -438,6 +575,21 @@ impl SessionManager {
     pub async fn cmdj(&self, cmd: &str) -> Result<Value, RizinError> {
         let out = check(cmd, self.exec(cmd).await?)?;
         parse_json(cmd, &out)
+    }
+
+    pub async fn cached_strings(&self) -> Option<Arc<Vec<StringEntry>>> {
+        self.inner
+            .lock()
+            .await
+            .session
+            .as_ref()
+            .and_then(|s| s.strings.clone())
+    }
+
+    pub async fn set_cached_strings(&self, entries: Arc<Vec<StringEntry>>) {
+        if let Some(s) = self.inner.lock().await.session.as_mut() {
+            s.strings = Some(entries);
+        }
     }
 }
 

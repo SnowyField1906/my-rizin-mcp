@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
     let config = ServerConfig {
         transport: cli.transport.map(Into::into).unwrap_or_default(),
         rizin_binary: cli.rizin.clone(),
+        default_analysis: cli.analysis.into(),
         allow_write: cli.allow_write,
         allow_raw: !cli.no_raw,
         allow_debug: cli.allow_debug,
@@ -144,11 +145,15 @@ async fn main() -> anyhow::Result<()> {
     let server = RizinServer::new(config);
 
     if let Some(file) = cli.file.as_deref() {
-        match server
-            .manager()
-            .open(file, cli.analysis.into(), cli.allow_write)
-            .await
-        {
+        let res = if file.ends_with(".rzdb") {
+            server.manager().open_project(file, cli.allow_write).await
+        } else {
+            server
+                .manager()
+                .open(file, cli.analysis.into(), cli.allow_write)
+                .await
+        };
+        match res {
             Ok(info) => tracing::info!(file = %info.file, "opened startup file"),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to open startup file; continuing without it")

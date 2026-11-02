@@ -50,11 +50,11 @@ pub enum RizinError {
     WorkerGone,
 
     /// The session was closed or invalidated and must be reopened.
-    #[error("the rizin session is closed or no longer usable; open a file first")]
+    #[error("the rizin session is closed or no longer usable; call `open_project` (.rzdb) or `open_file` (binary) first")]
     SessionClosed,
 
     /// No file is currently open.
-    #[error("no file is open; call `open_file` first")]
+    #[error("no file is open; call `open_project` (.rzdb) or `open_file` (binary) first")]
     NoFileOpen,
 
     /// A low-level I/O error occurred while communicating with Rizin.

@@ -7,7 +7,13 @@
 //! Rizin has no native pagination yet (rizinorg/rizin#6543, D1), so it still
 //! produces the full listing and the slicing happens here.
 
+use serde::de::{Deserializer as _, IgnoredAny, SeqAccess, Visitor};
 use serde_json::{Value, json};
+
+const ADDRESS_KEYS: &[&str] = &[
+    "offset", "address", "vaddr", "paddr", "addr", "from", "to", "jump", "fail", "fcn_addr",
+    "fcn_last", "baddr", "laddr", "entry", "ptr", "plt", "hvaddr", "hpaddr", "val",
+];
 
 /// The page of a listing to return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +37,63 @@ fn json_len(value: &Value) -> usize {
     serde_json::to_string(value).map_or(0, |s| s.len())
 }
 
+pub fn enrich_addresses(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                enrich_addresses(item);
+            }
+        }
+        Value::Object(map) => {
+            let is_page_meta = map.contains_key("returned") && map.contains_key("truncated");
+            let mut additions = Vec::new();
+            if !is_page_meta {
+                for (k, v) in map.iter() {
+                    if ADDRESS_KEYS.contains(&k.as_str())
+                        && let Some(n) = v.as_u64()
+                    {
+                        let hex_key = format!("{k}_hex");
+                        if !map.contains_key(&hex_key) {
+                            additions.push((hex_key, Value::String(format!("0x{n:x}"))));
+                        }
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                enrich_addresses(v);
+            }
+            for (k, v) in additions {
+                map.insert(k, v);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn compact_op(op: &mut Value) {
+    if let Value::Object(map) = op {
+        for noisy in [
+            "bytes",
+            "esil",
+            "refptr",
+            "reloc",
+            "fcn_addr",
+            "fcn_last",
+            "fcn_addr_hex",
+            "fcn_last_hex",
+            "family",
+            "type_num",
+            "type2_num",
+            "size",
+        ] {
+            map.remove(noisy);
+        }
+        if map.contains_key("disasm") {
+            map.remove("opcode");
+        }
+    }
+}
+
 /// Return `page` of `items` as `{"items", "total", "offset", "returned",
 /// "truncated"[, "next_offset"]}`, keeping the serialized items within
 /// `max_bytes` (at least one item is kept, so paging always progresses).
@@ -39,10 +102,11 @@ pub fn paginate(items: Vec<Value>, page: Page, max_bytes: usize) -> Value {
     let offset = page.offset.min(total);
     let mut returned = Vec::new();
     let mut size = 2; // the brackets
-    for item in items.into_iter().skip(offset) {
+    for mut item in items.into_iter().skip(offset) {
         if page.limit.is_some_and(|l| returned.len() >= l) {
             break;
         }
+        enrich_addresses(&mut item);
         let len = json_len(&item) + 1; // the separating comma
         if !returned.is_empty() && size + len > max_bytes {
             break;
@@ -50,6 +114,153 @@ pub fn paginate(items: Vec<Value>, page: Page, max_bytes: usize) -> Value {
         size += len;
         returned.push(item);
     }
+    let count = returned.len();
+    let next = offset + count;
+    let mut out = json!({
+        "items": returned,
+        "total": total,
+        "offset": offset,
+        "returned": count,
+        "truncated": next < total,
+    });
+    if next < total {
+        out["next_offset"] = json!(next);
+    }
+    out
+}
+
+pub fn paginate_json_str(raw: &str, page: Page, max_bytes: usize) -> Option<Value> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+
+    struct PageVisitor {
+        page: Page,
+        max_bytes: usize,
+    }
+
+    impl<'de> Visitor<'de> for PageVisitor {
+        type Value = (Vec<Value>, usize);
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a JSON array")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut total = 0usize;
+            let mut returned = Vec::new();
+            let mut size = 2usize;
+            let mut full = false;
+
+            while total < self.page.offset {
+                if seq.next_element::<IgnoredAny>()?.is_none() {
+                    return Ok((returned, total));
+                }
+                total += 1;
+            }
+
+            while !full {
+                if self.page.limit.is_some_and(|l| returned.len() >= l) {
+                    break;
+                }
+                let Some(mut item) = seq.next_element::<Value>()? else {
+                    return Ok((returned, total));
+                };
+                total += 1;
+                enrich_addresses(&mut item);
+                let len = json_len(&item) + 1;
+                if !returned.is_empty() && size + len > self.max_bytes {
+                    full = true;
+                } else {
+                    size += len;
+                    returned.push(item);
+                }
+            }
+
+            while seq.next_element::<IgnoredAny>()?.is_some() {
+                total += 1;
+            }
+
+            Ok((returned, total))
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(trimmed);
+    let (returned, total) = de
+        .deserialize_seq(PageVisitor { page, max_bytes })
+        .ok()?;
+    if de.end().is_err() {
+        return None;
+    }
+
+    let offset = page.offset.min(total);
+    let count = returned.len();
+    let next = offset + count;
+    let mut out = json!({
+        "items": returned,
+        "total": total,
+        "offset": offset,
+        "returned": count,
+        "truncated": next < total,
+    });
+    if next < total {
+        out["next_offset"] = json!(next);
+    }
+    Some(out)
+}
+
+fn parse_afl_line(line: &str) -> Option<Value> {
+    let mut parts = line.split_whitespace();
+    let addr_str = parts.next()?;
+    let hex = addr_str
+        .strip_prefix("0x")
+        .or_else(|| addr_str.strip_prefix("0X"))?;
+    let offset = u64::from_str_radix(hex, 16).ok()?;
+    let nbbs: u64 = parts.next()?.parse().ok()?;
+    let size: u64 = parts.next()?.parse().ok()?;
+    let name: String = parts.collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "offset": offset,
+        "offset_hex": format!("0x{offset:x}"),
+        "name": name,
+        "size": size,
+        "nbbs": nbbs,
+    }))
+}
+
+pub fn paginate_afl(text: &str, page: Page, max_bytes: usize) -> Value {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("0x") || l.starts_with("0X"))
+        .collect();
+    let total = lines.len();
+    let offset = page.offset.min(total);
+    let mut returned = Vec::new();
+    let mut size = 2usize;
+
+    for &line in lines.iter().skip(offset) {
+        if page.limit.is_some_and(|l| returned.len() >= l) {
+            break;
+        }
+        let Some(item) = parse_afl_line(line) else {
+            continue;
+        };
+        let len = json_len(&item) + 1;
+        if !returned.is_empty() && size + len > max_bytes {
+            break;
+        }
+        size += len;
+        returned.push(item);
+    }
+
     let count = returned.len();
     let next = offset + count;
     let mut out = json!({

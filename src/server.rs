@@ -16,19 +16,39 @@ use rmcp::model::*;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use rmcp::{prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::ServerConfig;
 use crate::error::{IntoMcp, RizinError};
-use crate::output::{Page, paginate, truncate_text};
+use crate::output::{
+    Page, compact_op, enrich_addresses, paginate, paginate_afl, paginate_json_str, truncate_text,
+};
 use crate::params::*;
-use crate::session::{AnalysisLevel, SessionManager};
+use crate::session::{AnalysisLevel, SessionManager, StringEntry};
 use crate::status::CmdStatus;
 use crate::util::{
     at_suffix, clamp_count, gadget_matches_exactly, parse_hex_bytes, parse_instructions,
     parse_rop_query, quote_arg, to_hex, validate_algo, validate_flag_name, validate_location,
     validate_number, validate_path,
 };
+
+macro_rules! tool_ok {
+    ($expr:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => return Ok(tool_error(e)),
+        }
+    };
+}
+
+fn tool_error(e: ErrorData) -> CallToolResult {
+    let mut r = CallToolResult::error(vec![ContentBlock::text(e.message.into_owned())]);
+    if let Some(data) = e.data {
+        r.structured_content = Some(as_structured(data));
+    }
+    r
+}
 
 /// Resources exposed by the server: `(uri, display name, rizin JSON command)`.
 const RESOURCES: &[(&str, &str, &str)] = &[
@@ -50,13 +70,14 @@ const SIGDB_HINT: &str = "The sigdb is empty: Rizin installs it only when built 
 
 /// Human-readable usage instructions advertised to clients.
 const INSTRUCTIONS: &str = "\
-Drive the Rizin reverse-engineering framework. Start by calling `open_file` with \
-a path (analysis defaults to `basic`/`aa`; use `analyze` for deeper passes). Then \
+Drive the Rizin reverse-engineering framework (`api`: in-process ffi, `pipe`: sub-process pipe). \
+Start by calling `open_file` (binary, needs to manually execute `analyze` if opened with \
+`analysis: \"none\"`) or `open_project` (.rzdb, very likely already advanced analyzed). Then \
 explore with `list_functions`, `function_summary` (a function at a glance), \
-`disassemble_function`, `decompile`, `binary_info`, \
+`disassemble_function` (pass `compact: true` to save tokens), `decompile`, `binary_info`, \
 `headers`, `list_strings`, `imports`/`exports`/`symbols`, `xrefs_to`/`xrefs_from`, \
-and the search tools (`search_string`, `search_bytes`, `search_value`, `search_rop`, \
-`search_magic`, `search_crypto`). Inspect function signatures with \
+and the search tools (`search_string`, `search_bytes`, `search_asm`, `search_value`, \
+`search_rop`, `search_magic`, `search_crypto`). Inspect function signatures with \
 `function_signature`/`function_signature_bytes`, hash regions with `hash`, lift to \
 RzIL with `il_function`/`emulate_il`, and diff bytes with `compare_bytes`/`compare_file`. \
 Listings are paged: they return `items` with `total` and, when more remain, \
@@ -65,7 +86,7 @@ page size). `decompile` uses rz-ghidra or jsdec when installed (see `decompilers
 pseudo-disassembly. Name library functions with the `flirt_*` tools (FLIRT signatures) \
 and, when the rz-silhouette plugin is configured, with `silhouette`. \
 With --allow-write, record findings with `rename_function`, `rename_variable`, \
-`set_comment`, `set_flag`, and `set_function_signature`. \
+`set_comment`, `set_flag`, `set_function_signature`, `save_project`, and `export_annotations`. \
 Dynamic analysis is available via the `debug_*` tools when the server is started with \
 --allow-debug. Addresses may be hex (e.g. 0x401000) or flag/symbol names (e.g. main, \
 sym.imp.printf). For anything not covered by a dedicated tool, use `command` (text) or \
@@ -157,7 +178,8 @@ impl RizinServer {
         if value.is_array() {
             return self.page_result(value, Page::ALL);
         }
-        let value = as_structured(value);
+        let mut value = as_structured(value);
+        enrich_addresses(&mut value);
         let size = serde_json::to_string(&value).map_or(0, |s| s.len());
         let max = self.manager.config().max_output_bytes;
         if size > max {
@@ -178,6 +200,141 @@ impl RizinServer {
             self.page_result(value, self.page(p))
         } else {
             self.json_result(value)
+        }
+    }
+
+    async fn listing_cmd(&self, cmd: &str, p: &PageParams) -> Result<CallToolResult, ErrorData> {
+        let out = crate::backend::check(cmd, self.manager.exec(cmd).await.mcp()?).mcp()?;
+        let page = self.page(p);
+        let max_bytes = self.manager.config().max_output_bytes;
+        if let Some(paged) = paginate_json_str(&out.output, page, max_bytes) {
+            return Ok(structured_result(paged));
+        }
+        let value = crate::backend::parse_json(cmd, &out).mcp()?;
+        Ok(self.listing(value, p))
+    }
+
+    async fn string_index(&self) -> Result<Arc<Vec<StringEntry>>, ErrorData> {
+        if let Some(cached) = self.manager.cached_strings().await {
+            return Ok(cached);
+        }
+        #[derive(Deserialize)]
+        struct RawStr {
+            vaddr: u64,
+            size: u64,
+            #[serde(default)]
+            string: String,
+            #[serde(rename = "type", default)]
+            kind: String,
+        }
+        let table = self.cmdj_optional("izj", json!([])).await?;
+        let mut entries: Vec<StringEntry> = serde_json::from_value::<Vec<RawStr>>(table)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| StringEntry {
+                vaddr: r.vaddr,
+                size: r.size,
+                string: r.string,
+                ascii: matches!(r.kind.as_str(), "ascii" | "utf8"),
+            })
+            .collect();
+        entries.sort_unstable_by_key(|e| e.vaddr);
+        let arc = Arc::new(entries);
+        self.manager.set_cached_strings(arc.clone()).await;
+        Ok(arc)
+    }
+
+    async fn enrich_search_hits(&self, mut paged: Value) -> Value {
+        if let Some(items) = paged.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items.iter_mut().take(16) {
+                let addr = item
+                    .get("address")
+                    .or_else(|| item.get("offset"))
+                    .and_then(Value::as_u64);
+                let Some(off) = addr else {
+                    continue;
+                };
+                let loc = self.name_at(off).await;
+                let fcn = self
+                    .manager
+                    .cmdj(&format!("afij @ 0x{off:x}"))
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_array().and_then(|a| a.first()).cloned());
+                let context = if fcn.is_some() {
+                    self.manager
+                        .cmdj(&format!("pdj 3 @ 0x{off:x}"))
+                        .await
+                        .ok()
+                        .and_then(|v| {
+                            v.as_array().map(|ops| {
+                                ops.iter()
+                                    .filter_map(|op| {
+                                        let o = op.get("offset")?.as_u64()?;
+                                        let d = op
+                                            .get("disasm")
+                                            .or_else(|| op.get("opcode"))?
+                                            .as_str()?;
+                                        Some(Value::String(format!("0x{o:x}: {d}")))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                } else {
+                    None
+                };
+                if let Some(obj) = item.as_object_mut() {
+                    if !loc.is_empty() {
+                        obj.insert("location".to_string(), Value::String(loc));
+                    }
+                    if let Some(f) = fcn {
+                        let f_off = f.get("offset").and_then(Value::as_u64).unwrap_or(off);
+                        obj.insert(
+                            "function".to_string(),
+                            json!({
+                                "name": f.get("name"),
+                                "addr": format!("0x{f_off:x}"),
+                            }),
+                        );
+                    }
+                    if let Some(ctx) = context
+                        && !ctx.is_empty()
+                    {
+                        obj.insert("context".to_string(), Value::Array(ctx));
+                    }
+                }
+            }
+        }
+        paged
+    }
+
+    async fn describe_address(&self, addr: &str) -> String {
+        let numeric = u64::from_str_radix(addr.trim_start_matches("0x"), 16).ok();
+        let mut parts = Vec::new();
+        if let Some(a) = numeric
+            && let Ok(Value::Array(sections)) = self.manager.cmdj("iSj").await
+        {
+            for s in sections {
+                let vaddr = s.get("vaddr").and_then(Value::as_u64).unwrap_or(0);
+                let vsize = s.get("vsize").and_then(Value::as_u64).unwrap_or(0);
+                if (vaddr..vaddr.saturating_add(vsize)).contains(&a)
+                    && let Some(name) = s.get("name").and_then(Value::as_str)
+                {
+                    parts.push(format!("in section '{name}'"));
+                    break;
+                }
+            }
+        }
+        if let Some(a) = numeric {
+            let near = self.name_at(a).await;
+            if !near.is_empty() {
+                parts.push(format!("near '{near}'"));
+            }
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
         }
     }
 
@@ -344,9 +501,12 @@ impl RizinServer {
         let addr = self.resolve(loc).await?;
         let info = self.manager.cmdj(&format!("afij @ {addr}")).await.mcp()?;
         let Some(func) = info.as_array().and_then(|a| a.first()).cloned() else {
+            let ctx = self.describe_address(&addr).await;
             return Err(RizinError::InvalidArgument {
                 arg: loc.to_string(),
-                reason: "no function there (analyze it first, e.g. with analyze_function)".into(),
+                reason: format!(
+                    "no function at {addr}{ctx} (analyze it first, e.g. with analyze_function)"
+                ),
             }
             .to_error_data());
         };
@@ -589,9 +749,31 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<OpenFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let analysis = p.analysis.unwrap_or_default();
+        let analysis = p
+            .analysis
+            .unwrap_or(self.manager.config().default_analysis);
         let write = p.write.unwrap_or(false);
-        let info = self.manager.open(&p.path, analysis, write).await.mcp()?;
+        let info = tool_ok!(self.manager.open(&p.path, analysis, write).await.mcp());
+        Ok(self.json_result(serde_json::to_value(info).unwrap_or(Value::Null)))
+    }
+
+    #[tool(
+        description = "Open a saved Rizin project file (.rzdb), restoring all analyzed \
+        functions, symbols, renames, comments, flags, and types without re-running analysis. \
+        Replaces any currently open file (Po / rizin -p).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn open_project(
+        &self,
+        Parameters(p): Parameters<OpenProjectParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let write = p.write.unwrap_or(false);
+        let info = tool_ok!(self.manager.open_project(&p.path, write).await.mcp());
         Ok(self.json_result(serde_json::to_value(info).unwrap_or(Value::Null)))
     }
 
@@ -616,34 +798,38 @@ impl RizinServer {
             // Accept line-wrapped base64.
             "base64" => {
                 let compact: String = p.data.split_whitespace().collect();
-                BASE64.decode(compact).map_err(|e| {
+                tool_ok!(BASE64.decode(compact).map_err(|e| {
                     RizinError::InvalidArgument {
                         arg: "data".into(),
                         reason: format!("invalid base64: {e}"),
                     }
                     .to_error_data()
-                })?
+                }))
             }
-            "hex" => parse_hex_bytes(&p.data).mcp()?,
+            "hex" => tool_ok!(parse_hex_bytes(&p.data).mcp()),
             other => {
-                return Err(RizinError::InvalidArgument {
-                    arg: other.to_string(),
-                    reason: "encoding must be 'base64' or 'hex'".into(),
-                }
-                .to_error_data());
+                return Ok(tool_error(
+                    RizinError::InvalidArgument {
+                        arg: other.to_string(),
+                        reason: "encoding must be 'base64' or 'hex'".into(),
+                    }
+                    .to_error_data(),
+                ));
             }
         };
         let name = p.name.as_deref().unwrap_or("sample.bin");
-        let info = self
-            .manager
-            .open_bytes(
-                &bytes,
-                name,
-                p.analysis.unwrap_or_default(),
-                p.write.unwrap_or(false),
-            )
-            .await
-            .mcp()?;
+        let info = tool_ok!(
+            self.manager
+                .open_bytes(
+                    &bytes,
+                    name,
+                    p.analysis
+                        .unwrap_or(self.manager.config().default_analysis),
+                    p.write.unwrap_or(false),
+                )
+                .await
+                .mcp()
+        );
         Ok(self.json_result(serde_json::to_value(info).unwrap_or(Value::Null)))
     }
 
@@ -694,14 +880,14 @@ impl RizinServer {
     ) -> Result<CallToolResult, ErrorData> {
         let level = p.level.unwrap_or(AnalysisLevel::Full);
         if let Some(cmd) = level.command() {
-            self.manager.cmd(cmd).await.mcp()?;
+            tool_ok!(self.manager.cmd(cmd).await.mcp());
         }
         let functions = self
             .manager
-            .cmdj("aflj")
+            .cmd("aflc")
             .await
             .ok()
-            .and_then(|v| v.as_array().map(|a| a.len()))
+            .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(0);
         Ok(self.json_result(json!({ "level": level, "functions": functions })))
     }
@@ -720,9 +906,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AddressParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc = validate_location(&p.address).mcp()?;
-        self.manager.cmd(&format!("s {loc}")).await.mcp()?;
-        let offset = self.manager.cmd("s").await.mcp()?;
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        tool_ok!(self.manager.cmd(&format!("s {loc}")).await.mcp());
+        let offset = tool_ok!(self.manager.cmd("s").await.mcp());
         Ok(self.json_result(json!({ "offset": offset.trim() })))
     }
 
@@ -745,8 +931,8 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<CommandParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_raw()?;
-        let out = self.manager.exec(&p.command).await.mcp()?;
+        tool_ok!(self.ensure_raw());
+        let out = tool_ok!(self.manager.exec(&p.command).await.mcp());
         // A pipe to Rizin before 0.10 reports no status, so a command that
         // printed nothing but an error is taken as failed.
         let legacy_failure = out.status == CmdStatus::Unknown
@@ -813,8 +999,8 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<CommandParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_raw()?;
-        let value = self.manager.cmdj(&p.command).await.mcp()?;
+        tool_ok!(self.ensure_raw());
+        let value = tool_ok!(self.manager.cmdj(&p.command).await.mcp());
         Ok(self.json_result(value))
     }
 
@@ -826,7 +1012,7 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn binary_info(&self) -> Result<CallToolResult, ErrorData> {
-        Ok(self.json_result(self.manager.cmdj("ij").await.mcp()?))
+        Ok(self.json_result(tool_ok!(self.manager.cmdj("ij").await.mcp())))
     }
 
     /// Entry points (`iej`).
@@ -838,7 +1024,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("iej").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("iej", &p).await))
     }
 
     /// Sections (`iSj`).
@@ -850,7 +1036,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("iSj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("iSj", &p).await))
     }
 
     /// Segments (`iSSj`).
@@ -862,7 +1048,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("iSSj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("iSSj", &p).await))
     }
 
     /// Relocations (`irj`).
@@ -874,7 +1060,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("irj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("irj", &p).await))
     }
 
     /// Imports (`iij`).
@@ -886,7 +1072,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("iij").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("iij", &p).await))
     }
 
     /// Exports (`iEj`).
@@ -898,7 +1084,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("iEj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("iEj", &p).await))
     }
 
     /// Symbols (`isj`).
@@ -910,7 +1096,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("isj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("isj", &p).await))
     }
 
     /// Linked libraries (`ilj`).
@@ -922,7 +1108,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("ilj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("ilj", &p).await))
     }
 
     /// Classes (`icj`).
@@ -934,7 +1120,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("icj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("icj", &p).await))
     }
 
     /// Strings (`izzj`/`izj`).
@@ -948,7 +1134,7 @@ impl RizinServer {
         Parameters(p): Parameters<StringsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let cmd = if p.all.unwrap_or(true) { "izzj" } else { "izj" };
-        Ok(self.listing(self.manager.cmdj(cmd).await.mcp()?, &p.page))
+        Ok(tool_ok!(self.listing_cmd(cmd, &p.page).await))
     }
 
     /// Flags (`fj`), optionally restricted to one flag space.
@@ -961,29 +1147,28 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<FlagsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let flags = match &p.space {
+        match &p.space {
             Some(space) => {
-                let space = validate_location(space).mcp()?;
+                let space = tool_ok!(validate_location(space).mcp());
                 // `fs <space>` would select the space for every later `flj`,
                 // and `fss+` creates a space that does not exist.
-                let spaces = self.cmdj_optional("fslj", json!([])).await?;
+                let spaces = tool_ok!(self.cmdj_optional("fslj", json!([])).await);
                 let exists = spaces
                     .as_array()
                     .into_iter()
                     .flatten()
                     .any(|s| s.get("name").and_then(Value::as_str) == Some(space.as_str()));
                 if exists {
-                    self.manager
-                        .cmdj(&format!("fss+ {space};flj;fss-"))
-                        .await
-                        .mcp()?
+                    Ok(tool_ok!(
+                        self.listing_cmd(&format!("fss+ {space};flj;fss-"), &p.page)
+                            .await
+                    ))
                 } else {
-                    json!([])
+                    Ok(self.listing(json!([]), &p.page))
                 }
             }
-            None => self.manager.cmdj("flj").await.mcp()?,
-        };
-        Ok(self.listing(flags, &p.page))
+            None => Ok(tool_ok!(self.listing_cmd("flj", &p.page).await)),
+        }
     }
 
     /// Flag spaces (`fslj`).
@@ -995,21 +1180,32 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("fslj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("fslj", &p).await))
     }
 
     // --- Analysis / functions --------------------------------------------
 
-    /// Function list (`aflj`).
+    /// Function list (`afl` / `aflj`).
     #[tool(
-        description = "List analyzed functions with addresses, sizes and names (aflj).",
+        description = "List analyzed functions with addresses (`offset` / `offset_hex`), `name`, \
+        `size`, and basic-block count (`nbbs`). Fast summary by default (`afl`); set \
+        `detailed=true` for full `aflj` metadata.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_functions(
         &self,
-        Parameters(p): Parameters<PageParams>,
+        Parameters(p): Parameters<ListFunctionsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("aflj").await.mcp()?, &p))
+        if p.detailed.unwrap_or(false) {
+            return Ok(tool_ok!(self.listing_cmd("aflj", &p.page).await));
+        }
+        let text = tool_ok!(self.manager.cmd("afl").await.mcp());
+        let paged = paginate_afl(
+            &text,
+            self.page(&p.page),
+            self.manager.config().max_output_bytes,
+        );
+        Ok(structured_result(paged))
     }
 
     /// Aggregate view of a function in one call.
@@ -1027,7 +1223,7 @@ impl RizinServer {
     ) -> Result<CallToolResult, ErrorData> {
         let max_items = clamp_count(p.max_items, 20, 100) as usize;
         let snippet_lines = clamp_count(p.snippet_lines, 30, 500) as usize;
-        let (addr, info) = self.function_at(&p.at).await?;
+        let (addr, info) = tool_ok!(self.function_at(&p.at).await);
         let refs = |key: &str, kind: &str| -> Vec<u64> {
             let mut seen = Vec::new();
             for r in info
@@ -1054,7 +1250,7 @@ impl RizinServer {
             callees.push(json!({ "addr": format!("0x{to:x}"), "name": self.name_at(to).await }));
         }
 
-        let xrefs = self.manager.cmdj(&format!("axtj @ {addr}")).await.mcp()?;
+        let xrefs = tool_ok!(self.manager.cmdj(&format!("axtj @ {addr}")).await.mcp());
         let xrefs = xrefs.as_array().cloned().unwrap_or_default();
         let mut callers = Vec::new();
         for x in xrefs.iter().take(max_items) {
@@ -1069,19 +1265,20 @@ impl RizinServer {
         // Data references into the binary's strings. A reference often points
         // into a string whose tail another string shares, and `ps` would guess
         // its encoding anew, so the strings come from `izj`.
-        let table = self.cmdj_optional("izj", json!([])).await?;
-        let table: Vec<(u64, u64, &Value)> = table
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|s| Some((s.get("vaddr")?.as_u64()?, s.get("size")?.as_u64()?, s)))
-            .collect();
+        let data_addrs = refs("datarefs", "DATA");
+        let table = if data_addrs.is_empty() {
+            Arc::new(Vec::new())
+        } else {
+            tool_ok!(self.string_index().await)
+        };
         let mut strings = Vec::new();
         let mut string_refs = 0;
-        for to in refs("datarefs", "DATA") {
-            let Some((start, _, entry)) = table
-                .iter()
-                .find(|(start, size, _)| (*start..start + size).contains(&to))
+        for to in data_addrs {
+            let idx = table.partition_point(|s| s.vaddr <= to);
+            let Some(entry) = idx
+                .checked_sub(1)
+                .and_then(|i| table.get(i))
+                .filter(|s| (s.vaddr..s.vaddr.saturating_add(s.size)).contains(&to))
             else {
                 continue;
             };
@@ -1089,17 +1286,12 @@ impl RizinServer {
             if strings.len() >= max_items {
                 continue;
             }
-            let text = entry.get("string").and_then(Value::as_str).unwrap_or("");
-            let offset = (to - start) as usize;
-            let ascii = matches!(
-                entry.get("type").and_then(Value::as_str),
-                Some("ascii" | "utf8")
-            );
+            let offset = (to - entry.vaddr) as usize;
             // The referenced tail, when byte offsets are character offsets.
-            let tail = text.get(offset..).filter(|_| ascii);
+            let tail = entry.string.get(offset..).filter(|_| entry.ascii);
             strings.push(json!({
                 "addr": format!("0x{to:x}"),
-                "string": tail.unwrap_or(text),
+                "string": tail.unwrap_or(&entry.string),
                 "offset_in_string": if tail.is_some() { 0 } else { offset },
             }));
         }
@@ -1144,8 +1336,10 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("afij{suffix}")).await.mcp()?))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("afij{suffix}")).await.mcp()
+        )))
     }
 
     /// Function variables (`afvlj`).
@@ -1157,8 +1351,10 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("afvlj{suffix}")).await.mcp()?))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("afvlj{suffix}")).await.mcp()
+        )))
     }
 
     /// Analyze a single function (`af`) and return its info.
@@ -1176,9 +1372,11 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        self.manager.cmd(&format!("af{suffix}")).await.mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("afij{suffix}")).await.mcp()?))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        tool_ok!(self.manager.cmd(&format!("af{suffix}")).await.mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("afij{suffix}")).await.mcp()
+        )))
     }
 
     /// Cross-references to an address (`axtj`).
@@ -1190,10 +1388,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<XrefParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc = validate_location(&p.address).mcp()?;
-        Ok(self.listing(
-            self.manager.cmdj(&format!("axtj @ {loc}")).await.mcp()?,
-            &p.page,
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        Ok(tool_ok!(
+            self.listing_cmd(&format!("axtj @ {loc}"), &p.page).await
         ))
     }
 
@@ -1206,10 +1403,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<XrefParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc = validate_location(&p.address).mcp()?;
-        Ok(self.listing(
-            self.manager.cmdj(&format!("axfj @ {loc}")).await.mcp()?,
-            &p.page,
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        Ok(tool_ok!(
+            self.listing_cmd(&format!("axfj @ {loc}"), &p.page).await
         ))
     }
 
@@ -1222,8 +1418,10 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("agf j{suffix}")).await.mcp()?))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("agf j{suffix}")).await.mcp()
+        )))
     }
 
     // --- Disassembly / printing ------------------------------------------
@@ -1231,7 +1429,8 @@ impl RizinServer {
     /// Disassemble N instructions (`pdj`).
     #[tool(
         description = "Disassemble a number of instructions at a location (default 32) as \
-        structured JSON (pdj).",
+        structured JSON (pdj). Set `compact=true` to strip noisy fields (`bytes`, `esil`, \
+        `reloc`, `opcode`) and save tokens.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn disassemble(
@@ -1239,23 +1438,33 @@ impl RizinServer {
         Parameters(p): Parameters<DisasmParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let count = clamp_count(p.count, 32, self.manager.config().max_count);
-        let suffix = at_suffix(&p.at).mcp()?;
-        let ops = self
-            .manager
-            .cmdj(&format!("pdj {count}{suffix}"))
-            .await
-            .mcp()?;
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        let mut ops = tool_ok!(
+            self.manager
+                .cmdj(&format!("pdj {count}{suffix}"))
+                .await
+                .mcp()
+        );
         // Since Rizin 0.10, `pdj` also lists what it could not read, as 0xff
         // `invalid` instructions, without a message: where nothing readable
         // is mapped, `aij` has no `read`.
         if ops[0]["opcode"] == "invalid" {
-            let info = self.manager.cmdj(&format!("aij{suffix}")).await.mcp()?;
+            let info = tool_ok!(self.manager.cmdj(&format!("aij{suffix}")).await.mcp());
             if info.get("read").is_none() {
-                return Err(RizinError::InvalidArgument {
-                    arg: p.at.clone().unwrap_or_else(|| "the current seek".into()),
-                    reason: "nothing readable is mapped there".into(),
-                }
-                .to_error_data());
+                return Ok(tool_error(
+                    RizinError::InvalidArgument {
+                        arg: p.at.clone().unwrap_or_else(|| "the current seek".into()),
+                        reason: "nothing readable is mapped there".into(),
+                    }
+                    .to_error_data(),
+                ));
+            }
+        }
+        if p.compact.unwrap_or(false)
+            && let Value::Array(arr) = &mut ops
+        {
+            for op in arr {
+                compact_op(op);
             }
         }
         Ok(self.json_result(ops))
@@ -1265,16 +1474,23 @@ impl RizinServer {
     #[tool(
         description = "Disassemble the function at a location as structured JSON (pdfj). \
         Its instructions (`ops`) are paged with offset/limit like a listing; the page \
-        details are in `ops_page`.",
+        details are in `ops_page`. Set `compact=true` to strip noisy fields (`bytes`, `esil`, \
+        `reloc`, `opcode`) and save tokens.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn disassemble_function(
         &self,
         Parameters(p): Parameters<FunctionPageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        let mut func = self.manager.cmdj(&format!("pdfj{suffix}")).await.mcp()?;
-        if let Some(Value::Array(ops)) = func.get_mut("ops").map(Value::take) {
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        let mut func = tool_ok!(self.manager.cmdj(&format!("pdfj{suffix}")).await.mcp());
+        let is_compact = p.compact.unwrap_or(false);
+        if let Some(Value::Array(mut ops)) = func.get_mut("ops").map(Value::take) {
+            if is_compact {
+                for op in &mut ops {
+                    compact_op(op);
+                }
+            }
             // Leave room for the rest of the function object and the page info.
             let rest = serde_json::to_string(&func).map_or(0, |s| s.len()) + 256;
             let budget = self.manager.config().max_output_bytes.saturating_sub(rest);
@@ -1302,9 +1518,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<DecompileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
         let which = p.decompiler.as_deref().unwrap_or("auto").to_lowercase();
-        let (engine, text, skipped) = self.decompile_text(&suffix, &which).await?;
+        let (engine, text, skipped) = tool_ok!(self.decompile_text(&suffix, &which).await);
         Ok(self.text_result_meta(text, json!({ "decompiler": engine, "skipped": skipped })))
     }
 
@@ -1316,7 +1532,7 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn decompilers(&self) -> Result<CallToolResult, ErrorData> {
-        let plugins = self.cmdj_optional("Lcj", json!([])).await?;
+        let plugins = tool_ok!(self.cmdj_optional("Lcj", json!([])).await);
         let has = |needle: &str| {
             plugins.as_array().is_some_and(|arr| {
                 arr.iter().any(|p| {
@@ -1342,7 +1558,8 @@ impl RizinServer {
             result["hint"] = json!(
                 "rz-ghidra (pdg) and jsdec (pdd) are separate plugins: install them with \
                  `rz-pm install rz-ghidra jsdec`, or build them against this Rizin and put \
-                 them in `plugin_dir`; the server picks them up on the next open_file."
+                 them in `plugin_dir`; the server picks them up on the next open_file or \
+                 open_project."
             );
         }
         Ok(self.json_result(result))
@@ -1358,13 +1575,13 @@ impl RizinServer {
         Parameters(p): Parameters<HexdumpParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let count = clamp_count(p.count, 64, self.manager.config().max_bytes);
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
             self.manager
                 .cmdj(&format!("pxj {count}{suffix}"))
                 .await
-                .mcp()?,
-        ))
+                .mcp()
+        )))
     }
 
     /// Read raw bytes (`p8`).
@@ -1378,23 +1595,26 @@ impl RizinServer {
         Parameters(p): Parameters<ReadBytesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let count = clamp_count(p.count, 64, self.manager.config().max_bytes);
-        let suffix = at_suffix(&p.at).mcp()?;
-        let hex = self
-            .manager
-            .cmd(&format!("p8 {count}{suffix}"))
-            .await
-            .mcp()?;
-        let bytes = parse_hex_bytes(hex.trim()).mcp()?;
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        let hex = tool_ok!(
+            self.manager
+                .cmd(&format!("p8 {count}{suffix}"))
+                .await
+                .mcp()
+        );
+        let bytes = tool_ok!(parse_hex_bytes(hex.trim()).mcp());
         let encoding = p.encoding.as_deref().unwrap_or("hex").to_lowercase();
         let data = match encoding.as_str() {
             "hex" => to_hex(&bytes),
             "base64" => BASE64.encode(&bytes),
             other => {
-                return Err(RizinError::InvalidArgument {
-                    arg: other.to_string(),
-                    reason: "encoding must be 'hex' or 'base64'".into(),
-                }
-                .to_error_data());
+                return Ok(tool_error(
+                    RizinError::InvalidArgument {
+                        arg: other.to_string(),
+                        reason: "encoding must be 'hex' or 'base64'".into(),
+                    }
+                    .to_error_data(),
+                ));
             }
         };
         Ok(self.json_result(json!({
@@ -1415,13 +1635,13 @@ impl RizinServer {
         Parameters(p): Parameters<InstructionAnalysisParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let count = clamp_count(p.count, 1, self.manager.config().max_count);
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
             self.manager
                 .cmdj(&format!("aoj {count}{suffix}"))
                 .await
-                .mcp()?,
-        ))
+                .mcp()
+        )))
     }
 
     // --- Searching --------------------------------------------------------
@@ -1429,7 +1649,7 @@ impl RizinServer {
     /// Search for a string (`/xj` of its bytes).
     #[tool(
         description = "Search the whole address space for a string (matched as raw bytes). \
-        Returns match addresses (/xj).",
+        Returns match addresses with hex, containing function, and instruction context (/xj).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_string(
@@ -1437,35 +1657,80 @@ impl RizinServer {
         Parameters(p): Parameters<SearchStringParams>,
     ) -> Result<CallToolResult, ErrorData> {
         if p.query.is_empty() {
-            return Err(RizinError::InvalidArgument {
-                arg: p.query.clone(),
-                reason: "query must not be empty".into(),
-            }
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::InvalidArgument {
+                    arg: p.query.clone(),
+                    reason: "query must not be empty".into(),
+                }
+                .to_error_data(),
+            ));
         }
         let hex = to_hex(p.query.as_bytes());
-        Ok(self.listing(
-            self.manager.cmdj(&format!("/xj {hex}")).await.mcp()?,
-            &p.page,
-        ))
+        let mut r = tool_ok!(self.listing_cmd(&format!("/xj {hex}"), &p.page).await);
+        if let Some(sc) = r.structured_content.take() {
+            r = structured_result(self.enrich_search_hits(sc).await);
+        }
+        Ok(r)
     }
 
     /// Search for a byte pattern (`/xj`).
     #[tool(
         description = "Search the whole address space for a hex byte pattern (e.g. '90 90' \
-        or 'deadbeef'). Returns match addresses (/xj).",
+        or 'deadbeef'). Returns match addresses with hex, containing function, and \
+        instruction context (/xj).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_bytes(
         &self,
         Parameters(p): Parameters<SearchBytesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let bytes = parse_hex_bytes(&p.hex).mcp()?;
+        let bytes = tool_ok!(parse_hex_bytes(&p.hex).mcp());
         let hex = to_hex(&bytes);
-        Ok(self.listing(
-            self.manager.cmdj(&format!("/xj {hex}")).await.mcp()?,
-            &p.page,
-        ))
+        let mut r = tool_ok!(self.listing_cmd(&format!("/xj {hex}"), &p.page).await);
+        if let Some(sc) = r.structured_content.take() {
+            r = structured_result(self.enrich_search_hits(sc).await);
+        }
+        Ok(r)
+    }
+
+    #[tool(
+        description = "Assemble one or more instructions (separated by ';') for the binary's \
+        architecture and search the address space for the resulting machine bytes, returning \
+        matches with hex addresses, containing function, and instruction context (pa; /xj).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn search_asm(
+        &self,
+        Parameters(p): Parameters<SearchAsmParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let insns = tool_ok!(parse_instructions(&p.assembly).mcp());
+        let asm = tool_ok!(quote_arg(&insns.join(";")).mcp());
+        let cmd = format!("pa {asm}");
+        let out = tool_ok!(self.manager.exec(&cmd).await.mcp());
+        let out = tool_ok!(crate::backend::check(&cmd, out).mcp());
+        let bytes = tool_ok!(parse_hex_bytes(out.output.trim()).map_err(|_| {
+            if out.messages.is_empty() {
+                RizinError::InvalidArgument {
+                    arg: p.assembly.clone(),
+                    reason: format!("assembled to no bytes ({:?})", out.output.trim()),
+                }
+            } else {
+                RizinError::CommandFailed {
+                    cmd: cmd.clone(),
+                    status: out.status,
+                    detail: out.detail(),
+                }
+            }
+            .to_error_data()
+        }));
+        let hex = to_hex(&bytes);
+        let mut r = tool_ok!(self.listing_cmd(&format!("/xj {hex}"), &p.page).await);
+        if let Some(mut sc) = r.structured_content.take() {
+            sc = self.enrich_search_hits(sc).await;
+            sc["assembled_hex"] = json!(hex);
+            r = structured_result(sc);
+        }
+        Ok(r)
     }
 
     // --- Annotation (guarded by --allow-write) ----------------------------
@@ -1485,11 +1750,11 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<RenameFunctionParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let (addr, before) = self.function_at(&p.at).await?;
-        let name = quote_arg(&p.name).mcp()?;
-        self.cmd_strict(&format!("afn {name} @ {addr}")).await?;
-        let (_, after) = self.function_at(&addr).await?;
+        tool_ok!(self.ensure_annotate().await);
+        let (addr, before) = tool_ok!(self.function_at(&p.at).await);
+        let name = tool_ok!(quote_arg(&p.name).mcp());
+        tool_ok!(self.cmd_strict(&format!("afn {name} @ {addr}")).await);
+        let (_, after) = tool_ok!(self.function_at(&addr).await);
         Ok(self.json_result(json!({
             "function": addr,
             "previous_name": before["name"],
@@ -1512,13 +1777,15 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<RenameVariableParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let (addr, _) = self.function_at(&p.at).await?;
-        let new = quote_arg(&p.new_name).mcp()?;
-        let old = quote_arg(&p.old_name).mcp()?;
-        self.cmd_strict(&format!("afvn {new} {old} @ {addr}"))
-            .await?;
-        let vars = self.manager.cmdj(&format!("afvlj @ {addr}")).await.mcp()?;
+        tool_ok!(self.ensure_annotate().await);
+        let (addr, _) = tool_ok!(self.function_at(&p.at).await);
+        let new = tool_ok!(quote_arg(&p.new_name).mcp());
+        let old = tool_ok!(quote_arg(&p.old_name).mcp());
+        tool_ok!(
+            self.cmd_strict(&format!("afvn {new} {old} @ {addr}"))
+                .await
+        );
+        let vars = tool_ok!(self.manager.cmdj(&format!("afvlj @ {addr}")).await.mcp());
         let names: Vec<&str> = vars
             .as_object()
             .into_iter()
@@ -1528,11 +1795,13 @@ impl RizinServer {
             .filter_map(|v| v.get("name").and_then(Value::as_str))
             .collect();
         if !names.contains(&p.new_name.as_str()) {
-            return Err(RizinError::InvalidArgument {
-                arg: p.old_name,
-                reason: format!("no such variable in the function at {addr}"),
-            }
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::InvalidArgument {
+                    arg: p.old_name,
+                    reason: format!("no such variable in the function at {addr}"),
+                }
+                .to_error_data(),
+            ));
         }
         Ok(self.json_result(json!({
             "function": addr,
@@ -1557,14 +1826,14 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<SetCommentParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let addr = self.resolve(&p.address).await?;
-        let text = quote_arg(&p.text).mcp()?;
+        tool_ok!(self.ensure_annotate().await);
+        let addr = tool_ok!(self.resolve(&p.address).await);
+        let text = tool_ok!(quote_arg(&p.text).mcp());
         if !p.append.unwrap_or(false) {
-            self.cmd_strict(&format!("CC- @ {addr}")).await?;
+            tool_ok!(self.cmd_strict(&format!("CC- @ {addr}")).await);
         }
-        self.cmd_strict(&format!("CC {text} @ {addr}")).await?;
-        let comment = self.manager.cmd(&format!("CC. @ {addr}")).await.mcp()?;
+        tool_ok!(self.cmd_strict(&format!("CC {text} @ {addr}")).await);
+        let comment = tool_ok!(self.manager.cmd(&format!("CC. @ {addr}")).await.mcp());
         Ok(self.json_result(json!({
             "at": addr,
             "comment": comment.trim_end_matches('\n'),
@@ -1585,9 +1854,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AddressParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let addr = self.resolve(&p.address).await?;
-        self.cmd_strict(&format!("CC- @ {addr}")).await?;
+        tool_ok!(self.ensure_annotate().await);
+        let addr = tool_ok!(self.resolve(&p.address).await);
+        tool_ok!(self.cmd_strict(&format!("CC- @ {addr}")).await);
         Ok(self.json_result(json!({ "at": addr, "removed": true })))
     }
 
@@ -1606,15 +1875,14 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<SetFlagParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let name = validate_flag_name(&p.name).mcp()?;
-        let addr = self.resolve(&p.address).await?;
+        tool_ok!(self.ensure_annotate().await);
+        let name = tool_ok!(validate_flag_name(&p.name).mcp());
+        let addr = tool_ok!(self.resolve(&p.address).await);
         let size = clamp_count(p.size, 1, u64::MAX);
         // `f` refuses an address that already has a flag; `f+` adds one in
         // any case, and moves a flag of the same name.
-        self.cmd_strict(&format!("f+ {name} {size} @ {addr}"))
-            .await?;
-        let at = self.resolve(&name).await?;
+        tool_ok!(self.cmd_strict(&format!("f+ {name} {size} @ {addr}")).await);
+        let at = tool_ok!(self.resolve(&name).await);
         Ok(self.json_result(json!({ "name": name, "at": at, "size": size })))
     }
 
@@ -1632,11 +1900,11 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<FlagNameParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let name = validate_flag_name(&p.name).mcp()?;
+        tool_ok!(self.ensure_annotate().await);
+        let name = tool_ok!(validate_flag_name(&p.name).mcp());
         // `f-` of an unknown name succeeds silently.
-        self.resolve(&name).await?;
-        self.cmd_strict(&format!("f- {name}")).await?;
+        tool_ok!(self.resolve(&name).await);
+        tool_ok!(self.cmd_strict(&format!("f- {name}")).await);
         Ok(self.json_result(json!({ "name": name, "removed": true })))
     }
 
@@ -1656,11 +1924,13 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<SetSignatureParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_annotate().await?;
-        let (addr, _) = self.function_at(&p.at).await?;
-        let sig = quote_arg(&p.signature).mcp()?;
-        self.cmd_strict(&format!("afs {sig} @ {addr}")).await?;
-        Ok(self.json_result(self.manager.cmdj(&format!("afsj @ {addr}")).await.mcp()?))
+        tool_ok!(self.ensure_annotate().await);
+        let (addr, _) = tool_ok!(self.function_at(&p.at).await);
+        let sig = tool_ok!(quote_arg(&p.signature).mcp());
+        tool_ok!(self.cmd_strict(&format!("afs {sig} @ {addr}")).await);
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("afsj @ {addr}")).await.mcp()
+        )))
     }
 
     // --- Persistence -----------------------------------------------------
@@ -1693,8 +1963,8 @@ impl RizinServer {
     /// Save a Rizin project (`Ps`).
     #[tool(
         description = "Save the session (analysis, names, comments, flags, types) as a Rizin \
-        project file (.rzdb), to reopen later with `rizin -p <file>`. Requires --allow-write \
-        (it writes a file to disk) (Ps).",
+        project file (.rzdb), to reopen later with `open_project` or `rizin -p <file>`. \
+        Requires --allow-write (it writes a file to disk) (Ps).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1707,18 +1977,21 @@ impl RizinServer {
         Parameters(p): Parameters<SaveProjectParams>,
     ) -> Result<CallToolResult, ErrorData> {
         if !self.manager.config().allow_write {
-            return Err(RizinError::NotPermitted(
-                "save_project writes a file to disk; start the server with --allow-write".into(),
-            )
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::NotPermitted(
+                    "save_project writes a file to disk; start the server with --allow-write"
+                        .into(),
+                )
+                .to_error_data(),
+            ));
         }
-        let path = quote_arg(&p.path).mcp()?;
-        let out = self.manager.exec(&format!("Ps {path}")).await.mcp()?;
-        crate::backend::check(&format!("Ps {path}"), out).mcp()?;
-        let bytes = std::fs::metadata(&p.path).map(|m| m.len()).map_err(|e| {
+        let path = tool_ok!(quote_arg(&p.path).mcp());
+        let out = tool_ok!(self.manager.exec(&format!("Ps {path}")).await.mcp());
+        tool_ok!(crate::backend::check(&format!("Ps {path}"), out).mcp());
+        let bytes = tool_ok!(std::fs::metadata(&p.path).map(|m| m.len()).map_err(|e| {
             RizinError::Io(format!("the project was not written to {}: {e}", p.path))
                 .to_error_data()
-        })?;
+        }));
         Ok(self.json_result(json!({ "path": p.path, "bytes": bytes })))
     }
 
@@ -1739,10 +2012,10 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<WriteHexParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_write().await?;
-        let loc = validate_location(&p.address).mcp()?;
-        let bytes = parse_hex_bytes(&p.hex).mcp()?;
-        self.write_verified(&loc, &bytes).await?;
+        tool_ok!(self.ensure_write().await);
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        let bytes = tool_ok!(parse_hex_bytes(&p.hex).mcp());
+        tool_ok!(self.write_verified(&loc, &bytes).await);
         Ok(self.json_result(json!({ "wrote": bytes.len(), "at": loc })))
     }
 
@@ -1761,16 +2034,18 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<WriteStringParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_write().await?;
-        let loc = validate_location(&p.address).mcp()?;
+        tool_ok!(self.ensure_write().await);
+        let loc = tool_ok!(validate_location(&p.address).mcp());
         if p.text.is_empty() {
-            return Err(RizinError::InvalidArgument {
-                arg: p.text,
-                reason: "text must not be empty".into(),
-            }
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::InvalidArgument {
+                    arg: p.text,
+                    reason: "text must not be empty".into(),
+                }
+                .to_error_data(),
+            ));
         }
-        self.write_verified(&loc, p.text.as_bytes()).await?;
+        tool_ok!(self.write_verified(&loc, p.text.as_bytes()).await);
         Ok(self.json_result(json!({ "wrote": p.text.len(), "at": loc })))
     }
 
@@ -1790,16 +2065,16 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<WriteAssemblyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_write().await?;
-        let loc = validate_location(&p.address).mcp()?;
-        let insns = parse_instructions(&p.assembly).mcp()?;
+        tool_ok!(self.ensure_write().await);
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        let insns = tool_ok!(parse_instructions(&p.assembly).mcp());
         // `wa mov eax, 1` assembles each space-separated word as its own
         // instruction; one quoted, `;`-joined argument keeps them whole.
-        let asm = quote_arg(&insns.join(";")).mcp()?;
+        let asm = tool_ok!(quote_arg(&insns.join(";")).mcp());
         let cmd = format!("pa {asm} @ {loc}");
-        let out = self.manager.exec(&cmd).await.mcp()?;
-        let out = crate::backend::check(&cmd, out).mcp()?;
-        let bytes = parse_hex_bytes(out.output.trim()).map_err(|_| {
+        let out = tool_ok!(self.manager.exec(&cmd).await.mcp());
+        let out = tool_ok!(crate::backend::check(&cmd, out).mcp());
+        let bytes = tool_ok!(parse_hex_bytes(out.output.trim()).map_err(|_| {
             // A pipe to Rizin before 0.10 cannot report the failure, but its
             // message (e.g. "Cannot assemble") says what went wrong.
             if out.messages.is_empty() {
@@ -1815,8 +2090,8 @@ impl RizinServer {
                 }
             }
             .to_error_data()
-        })?;
-        self.write_verified(&loc, &bytes).await?;
+        }));
+        tool_ok!(self.write_verified(&loc, &bytes).await);
         Ok(self.json_result(json!({
             "wrote": bytes.len(),
             "at": loc,
@@ -1836,8 +2111,8 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<HashParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let algo = validate_algo(&p.algo).mcp()?;
-        let suffix = at_suffix(&p.at).mcp()?;
+        let algo = tool_ok!(validate_algo(&p.algo).mcp());
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
         // Temporary block size via `@!<size>` so we hash exactly `size` bytes.
         let bs = match p.size {
             Some(n) => format!(
@@ -1846,18 +2121,21 @@ impl RizinServer {
             ),
             None => String::new(),
         };
-        let out = self
-            .manager
-            .cmd(&format!("ph {algo}{suffix}{bs}"))
-            .await
-            .mcp()?;
+        let out = tool_ok!(
+            self.manager
+                .cmd(&format!("ph {algo}{suffix}{bs}"))
+                .await
+                .mcp()
+        );
         let digest = out.trim();
         if digest.is_empty() {
-            return Err(RizinError::InvalidArgument {
-                arg: p.algo,
-                reason: "no output (unknown algorithm? see hash_algorithms)".into(),
-            }
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::InvalidArgument {
+                    arg: p.algo,
+                    reason: "no output (unknown algorithm? see hash_algorithms)".into(),
+                }
+                .to_error_data(),
+            ));
         }
         Ok(self.json_result(json!({ "algorithm": algo, "digest": digest })))
     }
@@ -1871,7 +2149,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.manager.cmdj("phlj").await.mcp()?, &p))
+        Ok(tool_ok!(self.listing_cmd("phlj", &p).await))
     }
 
     // --- Binary parsing / headers ----------------------------------------
@@ -1883,7 +2161,7 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn headers(&self) -> Result<CallToolResult, ErrorData> {
-        Ok(self.json_result(self.manager.cmdj("iHj").await.mcp()?))
+        Ok(self.json_result(tool_ok!(self.manager.cmdj("iHj").await.mcp())))
     }
 
     /// Header field summary (`ihj`).
@@ -1892,7 +2170,7 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn header_fields(&self) -> Result<CallToolResult, ErrorData> {
-        Ok(self.json_result(self.cmdj_optional("ihj", json!(null)).await?))
+        Ok(self.json_result(tool_ok!(self.cmdj_optional("ihj", json!(null)).await)))
     }
 
     /// Code-signing / entitlements (`iCj`).
@@ -1902,7 +2180,7 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn signature_info(&self) -> Result<CallToolResult, ErrorData> {
-        Ok(self.json_result(self.cmdj_optional("iCj", json!(null)).await?))
+        Ok(self.json_result(tool_ok!(self.cmdj_optional("iCj", json!(null)).await)))
     }
 
     /// File version info (`iVj`).
@@ -1911,7 +2189,7 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn version_info(&self) -> Result<CallToolResult, ErrorData> {
-        Ok(self.json_result(self.cmdj_optional("iVj", json!(null)).await?))
+        Ok(self.json_result(tool_ok!(self.cmdj_optional("iVj", json!(null)).await)))
     }
 
     /// Embedded resources (`iRj`).
@@ -1923,7 +2201,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.cmdj_optional("iRj", json!([])).await?, &p))
+        Ok(self.listing(tool_ok!(self.cmdj_optional("iRj", json!([])).await), &p))
     }
 
     // --- Function signatures (FLIRT-style) -------------------------------
@@ -1938,8 +2216,10 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("afsj{suffix}")).await.mcp()?))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("afsj{suffix}")).await.mcp()
+        )))
     }
 
     /// Function signature bytes + mask (`afsbj`).
@@ -1954,8 +2234,10 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("afsbj{suffix}")).await.mcp()?))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("afsbj{suffix}")).await.mcp()
+        )))
     }
 
     // --- FLIRT signatures -------------------------------------------------
@@ -1983,13 +2265,13 @@ impl RizinServer {
                 }
                 | RizinError::EmptyJson { .. },
             ) => {
-                let table = self.manager.cmd("Fl").await.mcp()?;
+                let table = tool_ok!(self.manager.cmd("Fl").await.mcp());
                 if table.trim().is_empty() {
                     return Ok(self.json_result(empty));
                 }
                 return Ok(self.text_result(table));
             }
-            Err(e) => return Err(e.to_error_data()),
+            Err(e) => return Ok(tool_error(e.to_error_data())),
         };
         if sigdb.as_array().is_some_and(Vec::is_empty) {
             return Ok(self.json_result(empty));
@@ -2029,12 +2311,12 @@ impl RizinServer {
         // The filter is a substring of the signature files' sigdb paths
         // (e.g. `elf/x86/64`), so it is quoted rather than path-checked.
         let cmd = match &p.filter {
-            Some(f) => format!("Fa {}", quote_arg(f).mcp()?),
+            Some(f) => format!("Fa {}", tool_ok!(quote_arg(f).mcp())),
             None => "Fa".to_string(),
         };
-        let before = self.flirt_flag_count().await?;
-        let out = self.manager.cmd(&cmd).await.mcp()?;
-        let applied = self.flirt_flag_count().await?.saturating_sub(before);
+        let before = tool_ok!(self.flirt_flag_count().await);
+        let out = tool_ok!(self.manager.cmd(&cmd).await.mcp());
+        let applied = tool_ok!(self.flirt_flag_count().await).saturating_sub(before);
         let files: Vec<&str> = out
             .lines()
             .filter_map(|l| l.strip_prefix("Applying "))
@@ -2066,14 +2348,14 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<FlirtFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = validate_path(&p.path).mcp()?;
+        let path = tool_ok!(validate_path(&p.path).mcp());
         // `Fs` takes a glob; a plain path must exist.
         if !path.contains(['*', '?', '[']) && !std::path::Path::new(&path).is_file() {
-            return Err(RizinError::FileNotFound(path).to_error_data());
+            return Ok(tool_error(RizinError::FileNotFound(path).to_error_data()));
         }
         let cmd = format!("Fs {path}");
-        let out = self.manager.exec(&cmd).await.mcp()?;
-        let out = crate::backend::check(&cmd, out).mcp()?;
+        let out = tool_ok!(self.manager.exec(&cmd).await.mcp());
+        let out = tool_ok!(crate::backend::check(&cmd, out).mcp());
         // `Fs` reports success even when it cannot read a file, saying so only
         // in an error message.
         let errors: Vec<&str> = out
@@ -2083,12 +2365,14 @@ impl RizinServer {
             .filter(|m| m.starts_with("ERROR"))
             .collect();
         if !errors.is_empty() {
-            return Err(RizinError::CommandFailed {
-                cmd,
-                status: CmdStatus::Error,
-                detail: errors.join("\n"),
-            }
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::CommandFailed {
+                    cmd,
+                    status: CmdStatus::Error,
+                    detail: errors.join("\n"),
+                }
+                .to_error_data(),
+            ));
         }
         let matched = out
             .output
@@ -2112,14 +2396,16 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<FlirtFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = validate_path(&p.path).mcp()?;
-        let out = self.manager.cmd(&format!("Fd {path}")).await.mcp()?;
+        let path = tool_ok!(validate_path(&p.path).mcp());
+        let out = tool_ok!(self.manager.cmd(&format!("Fd {path}")).await.mcp());
         if out.trim().is_empty() {
-            return Err(RizinError::InvalidArgument {
-                arg: p.path,
-                reason: "no FLIRT data (missing or not a .sig/.pat file?)".into(),
-            }
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::InvalidArgument {
+                    arg: p.path,
+                    reason: "no FLIRT data (missing or not a .sig/.pat file?)".into(),
+                }
+                .to_error_data(),
+            ));
         }
         Ok(self.text_result(out))
     }
@@ -2141,16 +2427,19 @@ impl RizinServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Writing a file to disk is a filesystem mutation: gate behind --allow-write.
         if !self.manager.config().allow_write {
-            return Err(RizinError::NotPermitted(
-                "flirt_create writes a file to disk; start the server with --allow-write".into(),
-            )
-            .to_error_data());
+            return Ok(tool_error(
+                RizinError::NotPermitted(
+                    "flirt_create writes a file to disk; start the server with --allow-write"
+                        .into(),
+                )
+                .to_error_data(),
+            ));
         }
         if !self.manager.state().await.open {
-            return Err(RizinError::NoFileOpen.to_error_data());
+            return Ok(tool_error(RizinError::NoFileOpen.to_error_data()));
         }
-        let path = validate_path(&p.path).mcp()?;
-        let out = self.manager.cmd(&format!("Fc {path}")).await.mcp()?;
+        let path = tool_ok!(validate_path(&p.path).mcp());
+        let out = tool_ok!(self.manager.cmd(&format!("Fc {path}")).await.mcp());
         Ok(self.text_result(if out.trim().is_empty() {
             format!("Created FLIRT signature file at {path}.")
         } else {
@@ -2175,13 +2464,16 @@ impl RizinServer {
     async fn silhouette(&self) -> Result<CallToolResult, ErrorData> {
         const HINT: &str = "no output from `sil`. Ensure the rz-silhouette plugin is \
              installed and silhouette.{host,port,psk} are configured.";
-        let out = self
-            .manager
-            .cmd("sil")
-            .await
-            .map_err(|e| Self::plugin_hint(e, HINT))?;
+        let out = tool_ok!(
+            self.manager
+                .cmd("sil")
+                .await
+                .map_err(|e| Self::plugin_hint(e, HINT))
+        );
         if out.trim().is_empty() {
-            return Err(RizinError::NotPermitted(HINT.into()).to_error_data());
+            return Ok(tool_error(
+                RizinError::NotPermitted(HINT.into()).to_error_data(),
+            ));
         }
         Ok(self.text_result(out))
     }
@@ -2196,13 +2488,16 @@ impl RizinServer {
     async fn silhouette_test(&self) -> Result<CallToolResult, ErrorData> {
         const HINT: &str = "no output from `sil test`. Ensure the rz-silhouette plugin is \
              installed and silhouette.{host,port,psk} are configured.";
-        let out = self
-            .manager
-            .cmd("sil test")
-            .await
-            .map_err(|e| Self::plugin_hint(e, HINT))?;
+        let out = tool_ok!(
+            self.manager
+                .cmd("sil test")
+                .await
+                .map_err(|e| Self::plugin_hint(e, HINT))
+        );
         if out.trim().is_empty() {
-            return Err(RizinError::NotPermitted(HINT.into()).to_error_data());
+            return Ok(tool_error(
+                RizinError::NotPermitted(HINT.into()).to_error_data(),
+            ));
         }
         Ok(self.text_result(out))
     }
@@ -2219,31 +2514,50 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AtParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let suffix = at_suffix(&p.at).mcp()?;
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
         let cmd = format!("plf{suffix}");
-        // `plf` fails without saying why (and before Rizin 0.10, a pipe only
-        // sees no output); the usual reason is that there is no function.
-        let no_function = || {
-            RizinError::InvalidArgument {
-                arg: p.at.clone().unwrap_or_else(|| "the current seek".into()),
-                reason: "no function there (analyze it first, e.g. with analyze_function)".into(),
-            }
-            .to_error_data()
-        };
         let out = match self.manager.cmd(&cmd).await {
             Ok(out) => out,
             Err(RizinError::CommandFailed { detail, .. })
                 if detail.is_empty() && !self.has_function(&suffix).await =>
             {
-                return Err(no_function());
+                let loc = p.at.as_deref().unwrap_or("$$");
+                let ctx = if let Ok(addr) = self.resolve(loc).await {
+                    self.describe_address(&addr).await
+                } else {
+                    String::new()
+                };
+                return Ok(tool_error(
+                    RizinError::InvalidArgument {
+                        arg: p.at.clone().unwrap_or_else(|| "the current seek".into()),
+                        reason: format!(
+                            "no function there{ctx} (analyze it first, e.g. with analyze_function)"
+                        ),
+                    }
+                    .to_error_data(),
+                ));
             }
-            Err(e) => return Err(e.to_error_data()),
+            Err(e) => return Ok(tool_error(e.to_error_data())),
         };
         if out.trim().is_empty() {
             if !self.has_function(&suffix).await {
-                return Err(no_function());
+                let loc = p.at.as_deref().unwrap_or("$$");
+                let ctx = if let Ok(addr) = self.resolve(loc).await {
+                    self.describe_address(&addr).await
+                } else {
+                    String::new()
+                };
+                return Ok(tool_error(
+                    RizinError::InvalidArgument {
+                        arg: p.at.clone().unwrap_or_else(|| "the current seek".into()),
+                        reason: format!(
+                            "no function there{ctx} (analyze it first, e.g. with analyze_function)"
+                        ),
+                    }
+                    .to_error_data(),
+                ));
             }
-            return Err(RizinError::EmptyOutput { cmd }.to_error_data());
+            return Ok(tool_error(RizinError::EmptyOutput { cmd }.to_error_data()));
         }
         Ok(self.text_result(out))
     }
@@ -2265,13 +2579,17 @@ impl RizinServer {
         Parameters(p): Parameters<EmulateIlParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let loc = match &p.at {
-            Some(a) => validate_location(a).mcp()?,
-            None => self.manager.cmd("s").await.mcp()?.trim().to_string(),
+            Some(a) => tool_ok!(validate_location(a).mcp()),
+            None => tool_ok!(self.manager.cmd("s").await.mcp())
+                .trim()
+                .to_string(),
         };
         let steps = clamp_count(p.steps, 1, self.manager.config().max_count);
         // Initialise the VM at the location, then step and capture the changes.
-        self.manager.cmd(&format!("aezi @ {loc}")).await.mcp()?;
-        Ok(self.json_result(self.manager.cmdj(&format!("aezsej {steps}")).await.mcp()?))
+        tool_ok!(self.manager.cmd(&format!("aezi @ {loc}")).await.mcp());
+        Ok(self.json_result(tool_ok!(
+            self.manager.cmdj(&format!("aezsej {steps}")).await.mcp()
+        )))
     }
 
     // --- Diffing ----------------------------------------------------------
@@ -2286,15 +2604,12 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<CompareBytesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let bytes = parse_hex_bytes(&p.hex).mcp()?;
+        let bytes = tool_ok!(parse_hex_bytes(&p.hex).mcp());
         let hex = to_hex(&bytes);
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.listing(
-            self.manager
-                .cmdj(&format!("cxj {hex}{suffix}"))
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(tool_ok!(
+            self.listing_cmd(&format!("cxj {hex}{suffix}"), &p.page)
                 .await
-                .mcp()?,
-            &p.page,
         ))
     }
 
@@ -2309,14 +2624,11 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<CompareFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = validate_path(&p.path).mcp()?;
-        let suffix = at_suffix(&p.at).mcp()?;
-        Ok(self.listing(
-            self.manager
-                .cmdj(&format!("cfj {path}{suffix}"))
+        let path = tool_ok!(validate_path(&p.path).mcp());
+        let suffix = tool_ok!(at_suffix(&p.at).mcp());
+        Ok(tool_ok!(
+            self.listing_cmd(&format!("cfj {path}{suffix}"), &p.page)
                 .await
-                .mcp()?,
-            &p.page,
         ))
     }
 
@@ -2326,31 +2638,34 @@ impl RizinServer {
     #[tool(
         description = "Search the whole address space for an integer value of a given width \
         (1/2/4/8 bytes, default 4). Value may be decimal or 0x-hex. Returns match addresses \
-        (/vNj).",
+        with hex, containing function, and instruction context (/vNj).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_value(
         &self,
         Parameters(p): Parameters<SearchValueParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let value = validate_number(&p.value).mcp()?;
+        let value = tool_ok!(validate_number(&p.value).mcp());
         let size = match p.size.unwrap_or(4) {
             1 | 2 | 4 | 8 => p.size.unwrap_or(4),
             other => {
-                return Err(RizinError::InvalidArgument {
-                    arg: other.to_string(),
-                    reason: "size must be 1, 2, 4, or 8".into(),
-                }
-                .to_error_data());
+                return Ok(tool_error(
+                    RizinError::InvalidArgument {
+                        arg: other.to_string(),
+                        reason: "size must be 1, 2, 4, or 8".into(),
+                    }
+                    .to_error_data(),
+                ));
             }
         };
-        Ok(self.listing(
-            self.manager
-                .cmdj(&format!("/v{size}j {value}"))
+        let mut r = tool_ok!(
+            self.listing_cmd(&format!("/v{size}j {value}"), &p.page)
                 .await
-                .mcp()?,
-            &p.page,
-        ))
+        );
+        if let Some(sc) = r.structured_content.take() {
+            r = structured_result(self.enrich_search_hits(sc).await);
+        }
+        Ok(r)
     }
 
     /// Search for ROP gadgets (`/Rj`).
@@ -2369,23 +2684,21 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<SearchRopParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let fields = parse_rop_query(&p.query).mcp()?;
-        let filter = quote_arg(&fields.join(";")).mcp()?;
-        let range = self
-            .search_range(p.from.as_deref(), p.to.as_deref())
-            .await?;
+        let fields = tool_ok!(parse_rop_query(&p.query).mcp());
+        let filter = tool_ok!(quote_arg(&fields.join(";")).mcp());
+        let range = tool_ok!(
+            self.search_range(p.from.as_deref(), p.to.as_deref())
+                .await
+        );
         // Rizin's gadget cache lists gadgets in another order than a fresh
         // search, which mixes up the pages of a listing, and it keeps only
         // the first gadget of identical bytes in the range it was built for,
         // so a narrower search served from it misses gadgets.
-        let gadgets = self
-            .manager
-            .cmdj(&format!("/Rj {filter} @e:gadget.cache=false{range}"))
-            .await
-            .mcp()?;
+        let cmd = format!("/Rj {filter} @e:gadget.cache=false{range}");
         if !p.exact.unwrap_or(false) {
-            return Ok(self.listing(gadgets, &p.page));
+            return Ok(tool_ok!(self.listing_cmd(&cmd, &p.page).await));
         }
+        let gadgets = tool_ok!(self.manager.cmdj(&cmd).await.mcp());
         let exact: Vec<Value> = gadgets
             .as_array()
             .into_iter()
@@ -2407,7 +2720,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.cmdj_optional("/mj", json!([])).await?, &p))
+        Ok(self.listing(tool_ok!(self.cmdj_optional("/mj", json!([])).await), &p))
     }
 
     /// Search for cryptographic material (`/cmj`).
@@ -2420,7 +2733,7 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.listing(self.cmdj_optional("/cmj", json!([])).await?, &p))
+        Ok(self.listing(tool_ok!(self.cmdj_optional("/cmj", json!([])).await), &p))
     }
 
     // --- Debugging (guarded by --allow-debug) ----------------------------
@@ -2438,8 +2751,8 @@ impl RizinServer {
         )
     )]
     async fn debug_start(&self) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        let out = self.manager.cmd("ood").await.mcp()?;
+        tool_ok!(self.ensure_debug().await);
+        let out = tool_ok!(self.manager.cmd("ood").await.mcp());
         Ok(self.text_result(if out.trim().is_empty() {
             "Debug session started.".to_string()
         } else {
@@ -2458,8 +2771,8 @@ impl RizinServer {
         )
     )]
     async fn debug_stop(&self) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        let out = self.manager.cmd("doc").await.mcp()?;
+        tool_ok!(self.ensure_debug().await);
+        let out = tool_ok!(self.manager.cmd("doc").await.mcp());
         Ok(self.text_result(if out.trim().is_empty() {
             "Debug session closed.".to_string()
         } else {
@@ -2479,8 +2792,8 @@ impl RizinServer {
         )
     )]
     async fn debug_continue(&self) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        let out = self.manager.cmd("dc").await.mcp()?;
+        tool_ok!(self.ensure_debug().await);
+        let out = tool_ok!(self.manager.cmd("dc").await.mcp());
         Ok(self.text_result(if out.trim().is_empty() {
             "Continued.".to_string()
         } else {
@@ -2503,9 +2816,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<DebugStepParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
+        tool_ok!(self.ensure_debug().await);
         let count = clamp_count(p.count, 1, self.manager.config().max_count);
-        let out = self.manager.cmd(&format!("ds {count}")).await.mcp()?;
+        let out = tool_ok!(self.manager.cmd(&format!("ds {count}")).await.mcp());
         Ok(self.text_result(if out.trim().is_empty() {
             format!("Stepped {count} instruction(s).")
         } else {
@@ -2520,8 +2833,8 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn debug_registers(&self) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        Ok(self.json_result(self.manager.cmdj("drj").await.mcp()?))
+        tool_ok!(self.ensure_debug().await);
+        Ok(self.json_result(tool_ok!(self.manager.cmdj("drj").await.mcp())))
     }
 
     /// Set a breakpoint (`db @ addr`).
@@ -2539,9 +2852,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AddressParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        let loc = validate_location(&p.address).mcp()?;
-        self.manager.cmd(&format!("db @ {loc}")).await.mcp()?;
+        tool_ok!(self.ensure_debug().await);
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        tool_ok!(self.manager.cmd(&format!("db @ {loc}")).await.mcp());
         Ok(self.json_result(json!({ "breakpoint_set": loc })))
     }
 
@@ -2560,9 +2873,9 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<AddressParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        let loc = validate_location(&p.address).mcp()?;
-        self.manager.cmd(&format!("db- @ {loc}")).await.mcp()?;
+        tool_ok!(self.ensure_debug().await);
+        let loc = tool_ok!(validate_location(&p.address).mcp());
+        tool_ok!(self.manager.cmd(&format!("db- @ {loc}")).await.mcp());
         Ok(self.json_result(json!({ "breakpoint_removed": loc })))
     }
 
@@ -2575,8 +2888,8 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        Ok(self.listing(self.manager.cmdj("dblj").await.mcp()?, &p))
+        tool_ok!(self.ensure_debug().await);
+        Ok(tool_ok!(self.listing_cmd("dblj", &p).await))
     }
 
     /// Backtrace (`dbtj`).
@@ -2589,8 +2902,8 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        Ok(self.listing(self.manager.cmdj("dbtj").await.mcp()?, &p))
+        tool_ok!(self.ensure_debug().await);
+        Ok(tool_ok!(self.listing_cmd("dbtj", &p).await))
     }
 
     /// Memory maps (`dmj`).
@@ -2603,8 +2916,8 @@ impl RizinServer {
         &self,
         Parameters(p): Parameters<PageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        Ok(self.listing(self.manager.cmdj("dmj").await.mcp()?, &p))
+        tool_ok!(self.ensure_debug().await);
+        Ok(tool_ok!(self.listing_cmd("dmj", &p).await))
     }
 
     /// Debuggee status (`dij`).
@@ -2614,8 +2927,8 @@ impl RizinServer {
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn debug_status(&self) -> Result<CallToolResult, ErrorData> {
-        self.ensure_debug().await?;
-        Ok(self.json_result(self.manager.cmdj("dij").await.mcp()?))
+        tool_ok!(self.ensure_debug().await);
+        Ok(self.json_result(tool_ok!(self.manager.cmdj("dij").await.mcp())))
     }
 }
 
@@ -2819,6 +3132,7 @@ mod tests {
             .collect();
         for expected in [
             "open_file",
+            "open_project",
             "close_file",
             "session_info",
             "analyze",
@@ -2848,6 +3162,7 @@ mod tests {
             "symbols",
             "search_string",
             "search_bytes",
+            "search_asm",
             "search_value",
             "search_rop",
             "search_magic",

@@ -29,6 +29,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::Path;
 use std::sync::{Mutex, Once};
 
 use crate::error::RizinError;
@@ -43,10 +44,12 @@ struct RzCore {
 // Rizin permission bits (from `rz_io.h`).
 const RZ_PERM_R: c_int = 4;
 const RZ_PERM_W: c_int = 2;
+const RZ_CORE_LOADLIBS_ALL: c_int = -1;
 
 unsafe extern "C" {
     fn rz_core_new() -> *mut RzCore;
     fn rz_core_free(core: *mut RzCore);
+    fn rz_core_loadlibs(core: *mut RzCore, where_: c_int, path: *const c_char) -> bool;
     fn rz_core_cmd0(core: *mut RzCore, cmd: *const c_char) -> c_int;
     #[cfg(rz_cmd_status)]
     fn rz_core_cmd_str_status(
@@ -68,11 +71,17 @@ unsafe extern "C" {
     fn rizin_mcp_log_set_sink(sink: Option<unsafe extern "C" fn(*const c_char, c_int)>);
 }
 
+#[derive(Default)]
+struct LogBuffer {
+    lines: Vec<String>,
+    bytes: usize,
+}
+
 /// Global guard ensuring only one thread is ever inside `librz`.
 static RZ_LOCK: Mutex<()> = Mutex::new(());
 
 /// Log lines of the command being run, or `None` between commands.
-static LOG_CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static LOG_CAPTURE: Mutex<Option<LogBuffer>> = Mutex::new(None);
 
 /// Upper bound on the raw log text kept per command; `clean_messages` keeps
 /// far less, this only bounds memory during a noisy command.
@@ -89,30 +98,40 @@ unsafe extern "C" fn log_sink(output: *const c_char, level: c_int) {
     if output.is_null() {
         return;
     }
-    // SAFETY: Rizin passes a NUL-terminated string valid for this call.
-    let line = unsafe { CStr::from_ptr(output) }.to_string_lossy();
     let mut capture = LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
     match capture.as_mut() {
-        Some(lines) => {
-            let size: usize = lines.iter().map(String::len).sum();
-            if size < LOG_CAPTURE_LIMIT {
-                lines.push(line.into_owned());
+        Some(buf) => {
+            if buf.bytes < LOG_CAPTURE_LIMIT {
+                // SAFETY: Rizin passes a NUL-terminated string valid for this call.
+                let line = unsafe { CStr::from_ptr(output) }
+                    .to_string_lossy()
+                    .into_owned();
+                buf.bytes += line.len();
+                buf.lines.push(line);
             }
         }
-        None if level >= RZ_LOGLVL_WARN => tracing::warn!(target: "rizin", "{}", line.trim_end()),
-        None => tracing::debug!(target: "rizin", "{}", line.trim_end()),
+        None => {
+            // SAFETY: Rizin passes a NUL-terminated string valid for this call.
+            let line = unsafe { CStr::from_ptr(output) }.to_string_lossy();
+            if level >= RZ_LOGLVL_WARN {
+                tracing::warn!(target: "rizin", "{}", line.trim_end());
+            } else {
+                tracing::debug!(target: "rizin", "{}", line.trim_end());
+            }
+        }
     }
 }
 
 /// Run `f` (which calls into Rizin) and return what Rizin logged meanwhile.
 /// Callers hold [`RZ_LOCK`], so no other command can interleave.
 fn with_log_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-    *LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    *LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(LogBuffer::default());
     let value = f();
     let lines = LOG_CAPTURE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
+        .map(|b| b.lines)
         .unwrap_or_default();
     for line in &lines {
         tracing::debug!(target: "rizin", "{}", line.trim_end());
@@ -146,7 +165,46 @@ impl Core {
         if ptr.is_null() {
             None
         } else {
+            unsafe {
+                rz_core_loadlibs(ptr, RZ_CORE_LOADLIBS_ALL, std::ptr::null());
+            }
             Some(Core { ptr })
+        }
+    }
+
+    fn load_plugins(&self) {
+        let mut dirs = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            dirs.push(format!("{home}/.local/lib/rizin/plugins"));
+            dirs.push(format!("{home}/.local/share/rizin/plugins"));
+        }
+        dirs.extend([
+            "/opt/homebrew/lib/rizin/plugins".to_string(),
+            "/usr/local/lib/rizin/plugins".to_string(),
+            "/usr/lib/rizin/plugins".to_string(),
+        ]);
+
+        for dir_str in dirs {
+            let dir = Path::new(&dir_str);
+            if dir.is_dir() {
+                if let Ok(c_dir) = CString::new(dir_str.as_str()) {
+                    let _g = lock();
+                    unsafe {
+                        rz_core_loadlibs(self.ptr, RZ_CORE_LOADLIBS_ALL, c_dir.as_ptr());
+                    }
+                }
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if let Some(ext) = path.extension()
+                            && (ext == "dylib" || ext == "so")
+                        {
+                            let path_str = path.to_string_lossy();
+                            let _ = self.cmd0(&format!("L {path_str}"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -160,6 +218,7 @@ impl Core {
         ] {
             let _ = self.cmd0(setting);
         }
+        self.load_plugins();
     }
 
     /// Run a command for its side effects, ignoring any textual output.

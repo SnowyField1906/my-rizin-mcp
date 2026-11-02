@@ -135,10 +135,11 @@ async fn clients_of_2026_07_28_need_no_initialize() {
             json!({ "name": "seek", "arguments": { "address": "0x0" }, "_meta": meta_2026() }),
         )
         .await;
+    let msg = call["error"]["message"]
+        .as_str()
+        .or_else(|| call["result"]["content"][0]["text"].as_str());
     assert!(
-        call["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("no file is open")),
+        msg.is_some_and(|m| m.contains("no file is open")),
         "{call}"
     );
 }

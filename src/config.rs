@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use crate::session::AnalysisLevel;
+
 /// Which backend the server uses to talk to Rizin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
@@ -25,6 +27,9 @@ pub struct ServerConfig {
     pub transport: Transport,
     /// Path or name of the `rizin` executable to spawn (pipe backend only).
     pub rizin_binary: String,
+    /// Default analysis level when `open_file` or `open_data` is called
+    /// without an explicit `analysis` argument.
+    pub default_analysis: AnalysisLevel,
     /// Whether files may be opened in write mode and write tools used.
     ///
     /// Writing can modify the in-memory buffer and, for files opened with
@@ -65,6 +70,7 @@ impl Default for ServerConfig {
         Self {
             transport: Transport::default(),
             rizin_binary: "rizin".to_string(),
+            default_analysis: AnalysisLevel::default(),
             allow_write: false,
             allow_raw: true,
             allow_debug: false,

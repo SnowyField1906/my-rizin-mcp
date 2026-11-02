@@ -19,11 +19,23 @@ pub struct OpenFileParams {
     /// Path to the binary/file to open, or a Rizin URI (e.g. `malloc://512`,
     /// `hex://9090`). Use `-` for an empty session with no file open.
     pub path: String,
-    /// Analysis depth to run immediately after opening. Defaults to `basic`.
+    /// Analysis depth to run immediately after opening. Defaults to be `none`
+    // unless overridden.
     #[serde(default)]
     pub analysis: Option<AnalysisLevel>,
     /// Open in write mode. Requires the server to be started with
     /// `--allow-write`.
+    #[serde(default)]
+    pub write: Option<bool>,
+}
+
+/// Parameters for `open_project`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OpenProjectParams {
+    /// Path to the saved Rizin project file (`.rzdb`) to load.
+    pub path: String,
+    /// Open the underlying binary in write mode. Requires the server to be
+    /// started with `--allow-write`.
     #[serde(default)]
     pub write: Option<bool>,
 }
@@ -39,6 +51,19 @@ pub struct PageParams {
     /// limit may return fewer; `truncated` then says more remain.
     #[serde(default)]
     pub limit: Option<u64>,
+}
+
+/// Parameters for `list_functions`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ListFunctionsParams {
+    /// Return full `aflj` details per function (cost, complexity, signature,
+    /// xrefs, variables) instead of the fast summary (`offset`, `offset_hex`,
+    /// `name`, `size`, `nbbs`). Defaults to `false`.
+    #[serde(default)]
+    pub detailed: Option<bool>,
+    /// Paging.
+    #[serde(flatten)]
+    pub page: PageParams,
 }
 
 /// Parameters for `open_data`.
@@ -80,6 +105,10 @@ pub struct DisasmParams {
     /// Number of instructions to disassemble (default 32).
     #[serde(default)]
     pub count: Option<u64>,
+    /// Strip noisy per-instruction fields (`bytes`, `esil`, `reloc`, `opcode`,
+    /// `fcn_addr`, `type_num`) to save tokens. Defaults to `false`.
+    #[serde(default)]
+    pub compact: Option<bool>,
 }
 
 /// Parameters for hexdumps.
@@ -142,6 +171,10 @@ pub struct FunctionPageParams {
     /// (e.g. `main`, `sym.main`, `entry0`). Defaults to the current seek.
     #[serde(default)]
     pub at: Option<String>,
+    /// Strip noisy per-instruction fields (`bytes`, `esil`, `reloc`, `opcode`,
+    /// `fcn_addr`, `type_num`) to save tokens. Defaults to `false`.
+    #[serde(default)]
+    pub compact: Option<bool>,
     /// Paging of the function's instructions.
     #[serde(flatten)]
     pub page: PageParams,
@@ -216,6 +249,18 @@ pub struct SearchStringParams {
 pub struct SearchBytesParams {
     /// Hex byte pattern, e.g. `90 90`, `9090`, or `0xdeadbeef`.
     pub hex: String,
+    /// Paging.
+    #[serde(flatten)]
+    pub page: PageParams,
+}
+
+/// Parameters for `search_asm`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchAsmParams {
+    /// One or more assembly instructions separated by `;` or newlines (e.g.
+    /// `mov w9, 0x7f5` on ARM64 or `mov eax, 1` on x86) to assemble for the
+    /// current binary's architecture and search across the address space.
+    pub assembly: String,
     /// Paging.
     #[serde(flatten)]
     pub page: PageParams,

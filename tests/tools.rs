@@ -6,7 +6,7 @@
 
 use rizin_mcp::RizinServer;
 use rizin_mcp::config::{ServerConfig, Transport};
-use rmcp::model::{CallToolRequestParams, CallToolResult};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorCode};
 use rmcp::service::{RoleClient, RunningService, ServiceError};
 use rmcp::{ErrorData, ServiceExt};
 use serde_json::{Value, json};
@@ -92,6 +92,18 @@ impl Session {
             params = params.with_arguments(map);
         }
         match self.client.call_tool(params).await {
+            Ok(r) if r.is_error == Some(true) && name != "command" => {
+                let msg = text_of(&r);
+                if msg.contains("output limit") {
+                    return Ok(r);
+                }
+                let code = if r.structured_content.is_some() {
+                    ErrorCode(-32001)
+                } else {
+                    ErrorCode(-32602)
+                };
+                Err(ErrorData::new(code, msg, r.structured_content))
+            }
             Ok(r) => Ok(r),
             Err(ServiceError::McpError(e)) => Err(e),
             Err(e) => panic!(
@@ -1001,6 +1013,29 @@ async fn work_can_be_exported_and_saved() {
         let export = s.ok("export_annotations", json!({})).await;
         assert_eq!(export["commands"], 4, "{t:?}: {export}"); // afn, CC-, CC, f+
         std::fs::write(&script, export["script"].as_str().unwrap()).unwrap();
+
+        let reopened = s
+            .ok("open_project", json!({ "path": project.to_string_lossy() }))
+            .await;
+        assert_eq!(reopened["file"], project.to_string_lossy().as_ref(), "{t:?}");
+        assert!(
+            reopened["functions"].as_u64().unwrap() > 0,
+            "{t:?}: {reopened}"
+        );
+        let info = s
+            .items("function_info", json!({ "at": "entry_logic" }))
+            .await;
+        assert_eq!(info[0]["name"], "entry_logic", "{t:?}");
+        s.ok("seek", json!({ "address": "mcp.mark" })).await;
+
+        let err = s
+            .call(
+                "open_project",
+                json!({ "path": "/definitely/not/here/missing.rzdb" }),
+            )
+            .await
+            .expect_err("missing project");
+        assert_eq!(err.code.0, -32602, "{t:?}: {err:?}");
 
         // Replaying the script on a fresh analysis restores the work.
         s.ok(

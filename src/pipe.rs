@@ -350,6 +350,7 @@ fn run_one(
 #[derive(Default)]
 struct Framer {
     pending: Vec<u8>,
+    scanned: usize,
 }
 
 impl Framer {
@@ -360,10 +361,21 @@ impl Framer {
 
     /// Take the next complete frame, without its terminator.
     fn next_frame(&mut self) -> Option<Vec<u8>> {
-        let end = self.pending.iter().position(|&b| b == NUL)?;
-        let mut frame: Vec<u8> = self.pending.drain(..=end).collect();
-        frame.pop();
-        Some(frame)
+        let Some(rel) = self.pending[self.scanned..].iter().position(|&b| b == NUL) else {
+            self.scanned = self.pending.len();
+            return None;
+        };
+        let end = self.scanned + rel;
+        self.scanned = 0;
+        if end + 1 == self.pending.len() {
+            let mut frame = std::mem::take(&mut self.pending);
+            frame.pop();
+            Some(frame)
+        } else {
+            let mut frame: Vec<u8> = self.pending.drain(..=end).collect();
+            frame.pop();
+            Some(frame)
+        }
     }
 }
 
