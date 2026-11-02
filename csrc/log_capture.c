@@ -4,6 +4,7 @@
 // RzLogCallback is variadic, which stable Rust cannot define, so this forwards
 // the formatted line of every Rizin log message to a plain Rust function.
 
+#include <rz_cons.h>
 #include <rz_util/rz_log.h>
 
 typedef void (*RizinMcpLogSink)(const char *output, int level);
@@ -36,5 +37,16 @@ void rizin_mcp_log_set_sink(RizinMcpLogSink sink) {
 		rz_log_add_callback(cb);
 	} else {
 		rz_log_del_callback(cb);
+	}
+}
+
+/**
+ * \brief Signal Rizin's console context to break out of the running command
+ *        loop (equivalent to Ctrl-C in the CLI) without closing the core.
+ */
+void rizin_mcp_cons_break(void) {
+	RzCons *cons = rz_cons_singleton();
+	if (cons && cons->context) {
+		cons->context->breaked = true;
 	}
 }

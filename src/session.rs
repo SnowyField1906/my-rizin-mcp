@@ -231,7 +231,12 @@ impl SessionManager {
             });
         }
 
-        self.close().await;
+        // Hold the slot lock for the entire open_project duration so any
+        // parallel tool calls issued in the same turn queue until loading
+        // finishes rather than failing with NoFileOpen.
+        let mut slot = self.inner.lock().await;
+        slot.ended = None;
+        slot.session = None;
 
         let backend = match self.config.transport {
             Transport::Pipe => {
@@ -314,7 +319,7 @@ impl SessionManager {
             _data: None,
         };
 
-        *self.inner.lock().await = Slot {
+        *slot = Slot {
             session: Some(session),
             ended: None,
             journal_file: Some(path.to_string()),
@@ -386,13 +391,12 @@ impl SessionManager {
             }
         }
 
-        // Tear down any existing session first, so at most one backend is ever
-        // live at a time. This matters for the in-process API backend, where
-        // Rizin's global state does not tolerate two cores at once; the
-        // synchronous `Drop` ensures the old core is fully freed before the new
-        // one is created. (A consequence is that a failed open leaves nothing
-        // open, rather than preserving the previous session.)
-        self.close().await;
+        // Hold the slot lock across teardown and startup so at most one backend
+        // is ever live at a time and concurrent tool calls wait for the open to
+        // complete.
+        let mut slot = self.inner.lock().await;
+        slot.ended = None;
+        slot.session = None;
 
         let backend = self.spawn_backend(path, write).await?;
         if let Some(dir) = &self.config.sigdb_path {
@@ -426,7 +430,7 @@ impl SessionManager {
             _data: data,
         };
 
-        *self.inner.lock().await = Slot {
+        *slot = Slot {
             session: Some(session),
             ended: None,
             journal_file: Some(path.to_string()),

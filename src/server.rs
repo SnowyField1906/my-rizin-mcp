@@ -28,9 +28,9 @@ use crate::params::*;
 use crate::session::{AnalysisLevel, SessionManager, StringEntry};
 use crate::status::CmdStatus;
 use crate::util::{
-    at_suffix, clamp_count, gadget_matches_exactly, parse_hex_bytes, parse_instructions,
-    parse_rop_query, quote_arg, to_hex, validate_algo, validate_flag_name, validate_location,
-    validate_number, validate_path,
+    assemble_arm64_cond_fallback, at_suffix, clamp_count, gadget_matches_exactly, parse_hex_bytes,
+    parse_hex_pattern, parse_instructions, parse_rop_query, quote_arg, to_hex, validate_algo,
+    validate_flag_name, validate_location, validate_number, validate_path,
 };
 
 macro_rules! tool_ok {
@@ -283,12 +283,24 @@ impl RizinServer {
                 } else {
                     None
                 };
-                if let Some(obj) = item.as_object_mut() {
-                    if !loc.is_empty() {
-                        obj.insert("location".to_string(), Value::String(loc));
-                    }
+                    if let Some(obj) = item.as_object_mut() {
                     if let Some(f) = fcn {
                         let f_off = f.get("offset").and_then(Value::as_u64).unwrap_or(off);
+                        let f_name = f.get("name").and_then(Value::as_str).unwrap_or("");
+                        let delta = off.saturating_sub(f_off);
+                        let f_loc = if delta == 0 {
+                            f_name.to_string()
+                        } else {
+                            format!("{f_name} + 0x{delta:x}")
+                        };
+                        obj.insert(
+                            "location".to_string(),
+                            Value::String(if loc.is_empty() || loc.starts_with("hit.") {
+                                f_loc
+                            } else {
+                                loc
+                            }),
+                        );
                         obj.insert(
                             "function".to_string(),
                             json!({
@@ -296,6 +308,8 @@ impl RizinServer {
                                 "addr": format!("0x{f_off:x}"),
                             }),
                         );
+                    } else if !loc.is_empty() {
+                        obj.insert("location".to_string(), Value::String(loc));
                     }
                     if let Some(ctx) = context
                         && !ctx.is_empty()
@@ -1188,8 +1202,7 @@ impl RizinServer {
     /// Function list (`afl` / `aflj`).
     #[tool(
         description = "List analyzed functions with addresses (`offset` / `offset_hex`), `name`, \
-        `size`, and basic-block count (`nbbs`). Fast summary by default (`afl`); set \
-        `detailed=true` for full `aflj` metadata.",
+        `size`, and basic-block count (`nbbs`), with optional `filter` and pagination.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_functions(
@@ -1200,8 +1213,18 @@ impl RizinServer {
             return Ok(tool_ok!(self.listing_cmd("aflj", &p.page).await));
         }
         let text = tool_ok!(self.manager.cmd("afl").await.mcp());
+        let filtered = match &p.filter {
+            Some(f) => {
+                let needle = f.to_lowercase();
+                text.lines()
+                    .filter(|l| l.to_lowercase().contains(&needle))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            None => text,
+        };
         let paged = paginate_afl(
-            &text,
+            &filtered,
             self.page(&p.page),
             self.manager.config().max_output_bytes,
         );
@@ -1480,8 +1503,15 @@ impl RizinServer {
     )]
     async fn disassemble_function(
         &self,
-        Parameters(p): Parameters<FunctionPageParams>,
+        Parameters(mut p): Parameters<FunctionPageParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if p.at.is_none()
+            && let Some(off) = p.page.offset
+            && off >= 0x10000
+        {
+            p.at = Some(format!("0x{off:x}"));
+            p.page.offset = None;
+        }
         let suffix = tool_ok!(at_suffix(&p.at).mcp());
         let mut func = tool_ok!(self.manager.cmdj(&format!("pdfj{suffix}")).await.mcp());
         let is_compact = p.compact.unwrap_or(false);
@@ -1675,18 +1705,17 @@ impl RizinServer {
 
     /// Search for a byte pattern (`/xj`).
     #[tool(
-        description = "Search the whole address space for a hex byte pattern (e.g. '90 90' \
-        or 'deadbeef'). Returns match addresses with hex, containing function, and \
-        instruction context (/xj).",
+        description = "Search the whole address space for a hex byte pattern (e.g. '90 90', \
+        'deadbeef', or masked patterns with '.' / '?' nibble wildcards like 'a93e8f52........'). \
+        Returns match addresses with hex, containing function, and instruction context (/xj).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_bytes(
         &self,
         Parameters(p): Parameters<SearchBytesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let bytes = tool_ok!(parse_hex_bytes(&p.hex).mcp());
-        let hex = to_hex(&bytes);
-        let mut r = tool_ok!(self.listing_cmd(&format!("/xj {hex}"), &p.page).await);
+        let pattern = tool_ok!(parse_hex_pattern(&p.hex).mcp());
+        let mut r = tool_ok!(self.listing_cmd(&format!("/xj {pattern}"), &p.page).await);
         if let Some(sc) = r.structured_content.take() {
             r = structured_result(self.enrich_search_hits(sc).await);
         }
@@ -1704,26 +1733,40 @@ impl RizinServer {
         Parameters(p): Parameters<SearchAsmParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let insns = tool_ok!(parse_instructions(&p.assembly).mcp());
-        let asm = tool_ok!(quote_arg(&insns.join(";")).mcp());
-        let cmd = format!("pa {asm}");
-        let out = tool_ok!(self.manager.exec(&cmd).await.mcp());
-        let out = tool_ok!(crate::backend::check(&cmd, out).mcp());
-        let bytes = tool_ok!(parse_hex_bytes(out.output.trim()).map_err(|_| {
-            if out.messages.is_empty() {
-                RizinError::InvalidArgument {
-                    arg: p.assembly.clone(),
-                    reason: format!("assembled to no bytes ({:?})", out.output.trim()),
-                }
-            } else {
-                RizinError::CommandFailed {
-                    cmd: cmd.clone(),
-                    status: out.status,
-                    detail: out.detail(),
-                }
+        let mut hex = String::new();
+        for insn in &insns {
+            if matches!(insn.as_str(), "*" | "." | "?") {
+                hex.push_str("........");
+                continue;
             }
-            .to_error_data()
-        }));
-        let hex = to_hex(&bytes);
+            let q = tool_ok!(quote_arg(insn).mcp());
+            let cmd = format!("pa {q}");
+            let out = tool_ok!(self.manager.exec(&cmd).await.mcp());
+            let trimmed = out.output.trim();
+            if !out.status.is_failure()
+                && let Ok(bytes) = parse_hex_bytes(trimmed)
+            {
+                hex.push_str(&to_hex(&bytes));
+                continue;
+            }
+            if let Some(fallback_hex) = assemble_arm64_cond_fallback(insn) {
+                hex.push_str(&fallback_hex);
+                continue;
+            }
+            let detail = if out.messages.is_empty() {
+                format!("cannot assemble instruction '{insn}'")
+            } else {
+                format!("cannot assemble '{insn}': {}", out.detail())
+            };
+            return Ok(tool_error(
+                RizinError::CommandFailed {
+                    cmd,
+                    status: out.status,
+                    detail,
+                }
+                .to_error_data(),
+            ));
+        }
         let mut r = tool_ok!(self.listing_cmd(&format!("/xj {hex}"), &p.page).await);
         if let Some(mut sc) = r.structured_content.take() {
             sc = self.enrich_search_hits(sc).await;

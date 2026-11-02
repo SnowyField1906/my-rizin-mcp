@@ -15,21 +15,6 @@
 //! worker to free the core), and [`crate::session`] tears down the previous
 //! session before opening a new one. Together these guarantee cores never
 //! overlap.
-//!
-//! ## Cancellation caveat
-//!
-//! A command runs as a synchronous C call on the worker thread. If one hangs
-//! (for example a pathological analysis, or a debugger/`!` shell escape invoked
-//! through the raw command tool), it cannot be safely interrupted the way a
-//! subprocess can be killed. On timeout the call returns
-//! [`RizinError::CommandTimeout`] and the session is marked dead; the worker
-//! stays blocked until the C call returns, holding the global Rizin lock, so
-//! its core is abandoned rather than joined. Until that call returns, a new
-//! in-process session cannot be created either: opening one fails at the
-//! startup timeout. A command that returns on its own (as in a `!sleep` test)
-//! only delays the next session; one that never returns blocks the in-process
-//! backend for the life of the server. For workloads that need hard
-//! cancellation, use the pipe backend.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +30,11 @@ use crate::status::CmdOutput;
 /// How long `Drop` waits for the worker to free its core before abandoning it
 /// (only relevant if a command is wedged inside librz).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long we wait for a Rizin command loop to honour `cons_break()` on
+/// timeout before considering the worker thread genuinely wedged (e.g. blocked
+/// inside an external `!sleep` shell escape).
+const BREAK_GRACE: Duration = Duration::from_millis(500);
 
 /// A command to run on the worker thread, with a channel for its result.
 struct Job {
@@ -123,23 +113,33 @@ impl RizinCore {
             return Err(RizinError::SessionClosed);
         }
         let tx = self.tx.as_ref().ok_or(RizinError::WorkerGone)?;
-        let (reply, rx) = oneshot::channel();
+        let (reply, mut rx) = oneshot::channel();
         tx.send(Job {
             cmd: cmd.to_string(),
             reply,
         })
         .map_err(|_| RizinError::WorkerGone)?;
 
-        match tokio::time::timeout(self.cmd_timeout, rx).await {
+        match tokio::time::timeout(self.cmd_timeout, &mut rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => {
                 self.alive.store(false, Ordering::SeqCst);
                 Err(RizinError::WorkerGone)
             }
             Err(_elapsed) => {
-                // The C call cannot be interrupted; refuse further work so the
-                // server stays responsive instead of queueing behind it.
-                self.alive.store(false, Ordering::SeqCst);
+                // Ask Rizin's console context to break out of the running loop
+                // (like Ctrl-C in the CLI). Built-in Rizin loops (`/x`, `/R`,
+                // `pd`, `aa`) check `cons->context->breaked` and return cleanly
+                // within milliseconds, keeping the open `RzCore` session alive!
+                ffi::cons_break();
+                match tokio::time::timeout(BREAK_GRACE, &mut rx).await {
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        // A command that ignored `cons_break` (such as an
+                        // external `!sleep` shell escape) is genuinely wedged.
+                        self.alive.store(false, Ordering::SeqCst);
+                    }
+                }
                 Err(RizinError::CommandTimeout {
                     cmd: cmd.to_string(),
                     secs: self.cmd_timeout.as_secs(),
@@ -152,6 +152,7 @@ impl RizinCore {
 impl Drop for RizinCore {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::SeqCst);
+        ffi::cons_break();
         // Close the command channel so the worker stops and frees its core.
         self.tx.take();
         // Wait (briefly) for confirmation that the core is freed, so a
@@ -210,8 +211,6 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_nul_and_runs_commands() {
-        // Open a tiny in-memory target so the session is live. `malloc://`
-        // needs no file on disk.
         let core = RizinCore::open(
             Some("malloc://64"),
             false,
@@ -221,11 +220,8 @@ mod tests {
         .await;
         if let Ok(core) = core {
             assert!(core.is_alive());
-            // Interior NUL is rejected.
             let err = core.exec("p8 4\0px").await;
             assert!(matches!(err, Err(RizinError::IllegalCommand { .. })));
-            // A normal command returns its captured output in-process.
-            // `malloc://64` is zero-filled, so 4 bytes hex-print as zeros.
             let out = core.exec("p8 4").await.expect("p8");
             assert_eq!(out.output.trim(), "00000000");
             assert!(!out.status.is_failure());
@@ -234,8 +230,6 @@ mod tests {
 
     #[tokio::test]
     async fn sequential_opens_do_not_overlap() {
-        // Repeatedly opening must work: each core is fully freed (synchronous
-        // Drop) before the next is created.
         for _ in 0..5 {
             let core = RizinCore::open(
                 Some("malloc://16"),
@@ -248,7 +242,6 @@ mod tests {
                 let out = core.exec("p8 1").await.expect("p8");
                 assert_eq!(out.output.trim(), "00");
             }
-            // `core` dropped here, synchronously freeing it.
         }
     }
 
@@ -269,7 +262,6 @@ mod tests {
             "messages: {:?}",
             out.messages
         );
-        // The capture ends with the command: a later success has no messages.
         let ok = core.exec("p8 1").await.expect("exec");
         assert!(!ok.status.is_failure());
         assert!(ok.messages.is_empty(), "messages: {:?}", ok.messages);

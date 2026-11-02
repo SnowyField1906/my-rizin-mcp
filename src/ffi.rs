@@ -69,6 +69,16 @@ unsafe extern "C" {
     fn rz_mem_free(p: *mut c_void);
     // csrc/log_capture.c
     fn rizin_mcp_log_set_sink(sink: Option<unsafe extern "C" fn(*const c_char, c_int)>);
+    fn rizin_mcp_cons_break();
+}
+
+/// Ask Rizin's console context to break out of the currently running command
+/// loop so a timed-out in-process command returns cleanly without destroying
+/// the open `RzCore` session.
+pub fn cons_break() {
+    unsafe {
+        rizin_mcp_cons_break();
+    }
 }
 
 #[derive(Default)]

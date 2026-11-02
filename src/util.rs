@@ -302,6 +302,146 @@ pub fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RizinError> {
     Ok(out)
 }
 
+/// Validate and normalize a hex byte pattern that may contain `.` or `?`
+/// nibble wildcards (as produced by `afsbj` and accepted by Rizin's `/xj`).
+pub fn parse_hex_pattern(s: &str) -> Result<String, RizinError> {
+    let mut cleaned = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '0' && matches!(chars.peek(), Some('x' | 'X')) {
+            chars.next();
+            continue;
+        }
+        if c.is_ascii_hexdigit() {
+            cleaned.push(c.to_ascii_lowercase());
+        } else if c == '.' || c == '?' {
+            cleaned.push('.');
+        } else {
+            return Err(RizinError::InvalidArgument {
+                arg: s.to_string(),
+                reason: format!("invalid hex/wildcard character {c:?}"),
+            });
+        }
+    }
+    if cleaned.is_empty() {
+        return Err(RizinError::InvalidArgument {
+            arg: s.to_string(),
+            reason: "no hex digits found".into(),
+        });
+    }
+    if !cleaned.len().is_multiple_of(2) {
+        return Err(RizinError::InvalidArgument {
+            arg: s.to_string(),
+            reason: "odd number of hex/wildcard nibbles".into(),
+        });
+    }
+    if cleaned.chars().all(|c| c == '.') {
+        return Err(RizinError::InvalidArgument {
+            arg: s.to_string(),
+            reason: "pattern cannot consist solely of wildcards".into(),
+        });
+    }
+    Ok(cleaned)
+}
+
+/// Fallback encoder for ARM64 conditional instructions (`cinc`, `cinv`, `cneg`,
+/// `cset`, `csetm`, `csel`, `csinc`, `csinv`, `csneg`) that Rizin's built-in
+/// `armass64` does not assemble. Returns 4 little-endian bytes as a hex string.
+pub fn assemble_arm64_cond_fallback(insn: &str) -> Option<String> {
+    let norm = insn.replace(',', " ");
+    let parts: Vec<&str> = norm.split_whitespace().collect();
+    let mnemonic = parts.first()?.to_ascii_lowercase();
+
+    let parse_reg = |r: &str| -> Option<(u32, u32)> {
+        let r = r.to_ascii_lowercase();
+        if r == "wzr" {
+            return Some((0, 31));
+        }
+        if r == "xzr" {
+            return Some((1, 31));
+        }
+        if let Some(n) = r.strip_prefix('w') {
+            return Some((0, n.parse::<u32>().ok().filter(|&v| v < 31)?));
+        }
+        if let Some(n) = r.strip_prefix('x') {
+            return Some((1, n.parse::<u32>().ok().filter(|&v| v < 31)?));
+        }
+        None
+    };
+
+    let parse_cond = |c: &str| -> Option<u32> {
+        Some(match c.to_ascii_lowercase().as_str() {
+            "eq" => 0,
+            "ne" => 1,
+            "cs" | "hs" => 2,
+            "cc" | "lo" => 3,
+            "mi" => 4,
+            "pl" => 5,
+            "vs" => 6,
+            "vc" => 7,
+            "hi" => 8,
+            "ls" => 9,
+            "ge" => 10,
+            "lt" => 11,
+            "gt" => 12,
+            "le" => 13,
+            "al" => 14,
+            "nv" => 15,
+            _ => return None,
+        })
+    };
+
+    let (sf, base, rd, rn, rm, cond) = match mnemonic.as_str() {
+        "cset" | "csetm" if parts.len() == 3 => {
+            let (sf, rd) = parse_reg(parts[1])?;
+            let cond = parse_cond(parts[2])? ^ 1;
+            let base = if mnemonic == "cset" {
+                0x1A800400
+            } else {
+                0x5A800000
+            };
+            (sf, base, rd, 31, 31, cond)
+        }
+        "cinc" | "cinv" | "cneg" if parts.len() == 4 => {
+            let (sf, rd) = parse_reg(parts[1])?;
+            let (sf2, rn) = parse_reg(parts[2])?;
+            if sf != sf2 {
+                return None;
+            }
+            let cond = parse_cond(parts[3])? ^ 1;
+            let base = match mnemonic.as_str() {
+                "cinc" => 0x1A800400,
+                "cinv" => 0x5A800000,
+                _ => 0x5A800400,
+            };
+            (sf, base, rd, rn, rn, cond)
+        }
+        "csel" | "csinc" | "csinv" | "csneg" if parts.len() == 5 => {
+            let (sf, rd) = parse_reg(parts[1])?;
+            let (sf2, rn) = parse_reg(parts[2])?;
+            let (sf3, rm) = parse_reg(parts[3])?;
+            if sf != sf2 || sf != sf3 {
+                return None;
+            }
+            let cond = parse_cond(parts[4])?;
+            let base = match mnemonic.as_str() {
+                "csel" => 0x1A800000,
+                "csinc" => 0x1A800400,
+                "csinv" => 0x5A800000,
+                _ => 0x5A800400,
+            };
+            (sf, base, rd, rn, rm, cond)
+        }
+        _ => return None,
+    };
+
+    let word: u32 = (sf << 31) | base | (rm << 16) | (cond << 12) | (rn << 5) | rd;
+    Some(to_hex(&word.to_le_bytes()))
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
