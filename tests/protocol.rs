@@ -128,7 +128,7 @@ async fn clients_of_2026_07_28_need_no_initialize() {
             .is_some_and(|t| !t.is_empty()),
         "{tools}"
     );
-    // A tool call without a session fails as a tool, not as the protocol.
+    // A tool call without a session returns an error result.
     let call = wire
         .request(
             "tools/call",

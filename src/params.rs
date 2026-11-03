@@ -169,10 +169,36 @@ pub struct PageParams {
     pub limit: Option<u64>,
 }
 
+/// Paging with an optional substring/regex filter.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct FilterPageParams {
+    /// Case-insensitive substring filter on names.
+    #[serde(default, alias = "query", alias = "pattern")]
+    pub filter: Option<String>,
+    /// Paging.
+    #[serde(flatten)]
+    pub page: PageParams,
+}
+
+/// Parameters for `classes`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ClassesParams {
+    /// Case-insensitive substring filter on class names.
+    #[serde(default, alias = "query", alias = "pattern")]
+    pub filter: Option<String>,
+    /// Omit the full `methods` and `fields` arrays (returning `method_count`
+    /// and `field_count` instead) to save tokens. Defaults to `false`.
+    #[serde(default)]
+    pub compact: Option<bool>,
+    /// Paging.
+    #[serde(flatten)]
+    pub page: PageParams,
+}
+
 /// Parameters for `list_functions`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ListFunctionsParams {
-    /// Case-insensitive substring or regex filter on function names.
+    /// Case-insensitive substring filter on function names.
     #[serde(default, alias = "query", alias = "pattern")]
     pub filter: Option<String>,
     /// Return full `aflj` details per function (cost, complexity, signature,
@@ -257,7 +283,12 @@ pub struct HexdumpParams {
     )]
     pub at: Option<String>,
     /// Number of bytes to dump (default 64).
-    #[serde(default, deserialize_with = "flex_opt_u64", alias = "size", alias = "limit")]
+    #[serde(
+        default,
+        deserialize_with = "flex_opt_u64",
+        alias = "size",
+        alias = "limit"
+    )]
     pub count: Option<u64>,
 }
 
@@ -274,7 +305,12 @@ pub struct ReadBytesParams {
     )]
     pub at: Option<String>,
     /// Number of bytes to read (default 64).
-    #[serde(default, deserialize_with = "flex_opt_u64", alias = "size", alias = "limit")]
+    #[serde(
+        default,
+        deserialize_with = "flex_opt_u64",
+        alias = "size",
+        alias = "limit"
+    )]
     pub count: Option<u64>,
     /// Output encoding: `hex` (default) or `base64`.
     #[serde(default)]
@@ -367,7 +403,7 @@ pub struct FunctionSummaryParams {
     #[serde(default, deserialize_with = "flex_opt_u64")]
     pub max_items: Option<u64>,
     /// Number of decompiled lines included (default 30, at most 500).
-    #[serde(default, deserialize_with = "flex_opt_u64")]
+    #[serde(default, deserialize_with = "flex_opt_u64", alias = "max_lines")]
     pub snippet_lines: Option<u64>,
 }
 
@@ -395,6 +431,9 @@ pub struct StringsParams {
     /// Defaults to `true`.
     #[serde(default)]
     pub all: Option<bool>,
+    /// Case-insensitive substring filter on strings.
+    #[serde(default, alias = "query", alias = "pattern")]
+    pub filter: Option<String>,
     /// Paging.
     #[serde(flatten)]
     pub page: PageParams,
@@ -406,6 +445,9 @@ pub struct FlagsParams {
     /// Restrict to a single flag space (e.g. `symbols`, `strings`, `imports`).
     #[serde(default)]
     pub space: Option<String>,
+    /// Case-insensitive substring filter on flag names.
+    #[serde(default, alias = "query", alias = "pattern")]
+    pub filter: Option<String>,
     /// Paging.
     #[serde(flatten)]
     pub page: PageParams,
@@ -426,7 +468,8 @@ pub struct SearchStringParams {
 /// Parameters for `search_bytes`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchBytesParams {
-    /// Hex byte pattern, e.g. `90 90`, `9090`, or `0xdeadbeef`.
+    /// Hex byte pattern, e.g. `90 90`, `9090`, `0xdeadbeef`, or masked patterns
+    /// with `.` / `?` nibble wildcards.
     #[serde(alias = "query", alias = "pattern", alias = "bytes", alias = "data")]
     pub hex: String,
     /// Paging.
